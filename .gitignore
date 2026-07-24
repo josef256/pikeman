@@ -1,0 +1,16 @@
+# Unity generated
+pikeman/Library/
+pikeman/Temp/
+pikeman/Logs/
+pikeman/UserSettings/
+pikeman/obj/
+pikeman/.vs/
+pikeman/*.csproj
+pikeman/*.sln
+pikeman/Assets/AssetStoreTools*
+
+# Build output (regenerable, and exceeds GitHub's file size limits)
+builds/
+
+# OS cruft
+.DS_Store
