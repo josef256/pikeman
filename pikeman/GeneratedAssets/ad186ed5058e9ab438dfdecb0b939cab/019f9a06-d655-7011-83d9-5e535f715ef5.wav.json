@@ -1,0 +1,15 @@
+{
+    "asset": "ad186ed5058e9ab438dfdecb0b939cab",
+    "fileName": "019f9a06-d655-7011-83d9-5e535f715ef5.wav",
+    "prompt": "hello soldiers ready for battle ? ",
+    "negativePrompt": "",
+    "model": "elevenlabs-multilingual-v2",
+    "modelName": "ElevenLabs Multilingual V2",
+    "customSeed": -1,
+    "w3CTraceId": "",
+    "feedback": 0,
+    "duration": 10.0,
+    "autoTrim": false,
+    "hasReference": false,
+    "voice": "Harry"
+}

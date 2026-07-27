@@ -10,8 +10,9 @@ namespace Battleship
     /// </summary>
     public class BattleshipController : MonoBehaviour
     {
-        private enum Phase { Setup, Playing, Over }
+        private enum Phase { Menu, Setup, Playing, Over }
         private enum PerkMode { None, Relocate, Intercept, Torpedo }
+        private enum Lang { EN, FR }
         private struct FleetShip { public ShipType type; public bool placed; public int x, y; public Orientation o; }
 
         private BattleshipMatch match;
@@ -21,6 +22,11 @@ namespace Battleship
         private bool targeting;
 
         private FleetShip[] fleet;
+        private string menuNote = "";       // transient home-menu status line (e.g. "coming soon")
+        private float menuNoteUntil = -1f;
+        private bool settingsOpen = false;  // settings panel overlaid on the home menu
+        private int activeSlider = -1;      // which settings slider is being dragged (0=music, 1=sfx, -1=none)
+        private Lang lang = Lang.EN;        // UI language; persisted in PlayerPrefs, switched from Settings
         private int dragIdx = -1;
         private Orientation orient = Orientation.Horizontal;
 
@@ -105,6 +111,8 @@ namespace Battleship
         private readonly System.Collections.Generic.List<(int x, int y, int kind)> debugMarks = new System.Collections.Generic.List<(int, int, int)>();
         private Texture2D markHit, markDestroyed, markMiss, markRecon; // PixelLab legend markers
         private Texture2D consoleTex; // UI/final — the COMPLETE console (header, frame, glass, slots baked in)
+        private Texture2D menuTex;    // UI/MainMenu — home-screen backdrop (title, ships, radar, empty button plates baked in)
+        private Texture2D fleetSetupTex; // UI/FleetPlacement — setup-screen backdrop (board frame, 5 empty berths, chips + button plates)
         private Texture2D frameTex;   // UI/finalframe — same console with the glass CUT OUT (top overlay, catches spills)
         // the scope glass inside the console art, as fractions (measured from the art)
         private const float HoleX = 0.0889f, HoleY = 0.1348f, HoleW = 0.6475f, HoleH = 0.6489f;
@@ -145,13 +153,15 @@ namespace Battleship
         private int pendX, pendY; private float pendReveal = -1f; // radar contact waiting on the flyover
         [Header("Audio")]
         [Range(0f, 1f)] public float sfxVolume = 0.8f;
+        [Range(0f, 1f)] public float musicVolume = 0.5f;  // home-menu theme level (independent of SFX)
         [Range(10f, 300f)] public float turnTime = 60f;   // YOUR turn clock — hits zero and the turn is skipped
         [Range(2f, 20f)] public float autoEndTurn = 8f;   // seconds after your action settles before the turn auto-ends
         private float actionEndT;                         // when the player's action visuals/audio are done
         private float planeSfxEndT;                       // when the recon plane engine audio finishes
-        private AudioSource audioSrc, audioLoop;          // one-shots + looping channel (torpedo run)
+        private AudioSource audioSrc, audioLoop, musicSrc; // one-shots + looping SFX channel (torpedo run) + music channel
         private AudioClip clipFire, clipSplash, clipSunk, clipTorpedo, clipTorpLaunch, clipTorpLoop, clipMissile, clipIntercept;
         private AudioClip clipPlane, clipPing, clipPeriscope, clipSail, clipClick, clipFlip, clipWin, clipLose;
+        private AudioClip clipMenuTheme;                   // Sfx/MenuTheme — home-menu soundtrack (loops)
         private AudioClip[] clipHits;
         private readonly System.Collections.Generic.List<(float t, AudioClip c, float vol)> pendingSfx = new();
 
@@ -210,7 +220,14 @@ namespace Battleship
             audioSrc.playOnAwake = false;
             audioLoop = gameObject.AddComponent<AudioSource>();
             audioLoop.playOnAwake = false; audioLoop.loop = true;
+            musicSrc = gameObject.AddComponent<AudioSource>();
+            musicSrc.playOnAwake = false; musicSrc.loop = true;
+            // restore player-chosen levels from a prior session (fall back to the Inspector defaults)
+            sfxVolume = Mathf.Clamp01(PlayerPrefs.GetFloat("pk_sfxVol", sfxVolume));
+            musicVolume = Mathf.Clamp01(PlayerPrefs.GetFloat("pk_musicVol", musicVolume));
+            lang = (Lang)Mathf.Clamp(PlayerPrefs.GetInt("pk_lang", 0), 0, 1);
             NewGame();
+            phase = Phase.Menu; // first screen on launch is the home menu, not fleet setup
         }
 
         private void Sfx(AudioClip c, float vol = 1f)
@@ -390,6 +407,9 @@ namespace Battleship
             markRecon = Resources.Load<Texture2D>("Radar/recon");
             consoleTex = Resources.Load<Texture2D>("UI/final");
             frameTex = Resources.Load<Texture2D>("UI/finalframe");
+            menuTex = Resources.Load<Texture2D>("UI/MainMenu");
+            fleetSetupTex = Resources.Load<Texture2D>("UI/FleetPlacement");
+            clipMenuTheme = Resources.Load<AudioClip>("Sfx/MenuTheme");
             if (ringTex == null)
             {
                 const int R = 128;
@@ -538,12 +558,26 @@ namespace Battleship
 
         private bool AllPlaced() { foreach (var f in fleet) if (!f.placed) return false; return true; }
 
+        // Home-menu soundtrack: loops while on the menu, fades out smoothly once the match begins.
+        private void UpdateMenuMusic()
+        {
+            if (musicSrc == null || clipMenuTheme == null) return;
+            bool wantMusic = phase == Phase.Menu && musicVolume > 0f;
+            float target = wantMusic ? musicVolume : 0f;
+            if (wantMusic && !musicSrc.isPlaying)
+            { musicSrc.clip = clipMenuTheme; musicSrc.volume = 0f; musicSrc.Play(); }
+            // ~0.8s fade either way (unscaled so a SPACE pause doesn't stall it)
+            musicSrc.volume = Mathf.MoveTowards(musicSrc.volume, target, Time.unscaledDeltaTime / 0.8f);
+            if (!wantMusic && musicSrc.isPlaying && musicSrc.volume <= 0.001f) musicSrc.Stop();
+        }
+
         private void Update()
         {
             Cursor.visible = false; // the game draws its own cursor (end of OnGUI)
             if (pendingMsg != null && Time.time >= pendingMsgAt) { message = pendingMsg; pendingMsg = null; }
             for (int i = pendingSfx.Count - 1; i >= 0; i--)
                 if (Time.time >= pendingSfx[i].t) { Sfx(pendingSfx[i].c, pendingSfx[i].vol); pendingSfx.RemoveAt(i); }
+            UpdateMenuMusic();
             if (phase != Phase.Playing) return;
             // radar sweep beeps: soft tick each rotation, stronger blip when the beam crosses a contact
             if (targeting && clipBeep != null)
@@ -572,7 +606,7 @@ namespace Battleship
             if (pendReveal >= 0f && Time.time >= pendReveal)
             {
                 radarIntel.Add((pendX, pendY));
-                message = "📡 CONTACT AT " + Coord(pendX, pendY) + "!";
+                message = string.Format(T("📡 CONTACT AT {0}!"), Coord(pendX, pendY));
                 float pingAt = Mathf.Max(Time.time, planeSfxEndT) + 0.15f; // CONTACT! — only once the engine is gone
                 QueueSfx(pingAt, clipPing);
                 QueueSfx(pingAt + 0.7f, clipPing, 0.8f);
@@ -668,7 +702,7 @@ namespace Battleship
                             }
                             lockT = Mathf.Max(lockT, launch + dur + 0.7f);
                         }
-                        string part = ev.Result.Outcome == FireOutcome.Intercepted ? "INTERCEPTED!" : Describe(ev.Result, false);
+                        string part = ev.Result.Outcome == FireOutcome.Intercepted ? T("INTERCEPTED!") : Describe(ev.Result, false);
                         msg += (i == 0 ? "" : "   ") + Coord(ev.X, ev.Y) + ": " + part;
                     }
                     // action first, result only when the ordnance actually lands
@@ -705,9 +739,9 @@ namespace Battleship
         private static string Coord(int x, int y) => ((char)('A' + x)).ToString() + (y + 1);
         private string Describe(FireResult r, bool atEnemy) => r.Outcome switch
         {
-            FireOutcome.Miss => "MISS",
-            FireOutcome.Hit => "HIT!",
-            FireOutcome.Sunk => "SUNK " + (atEnemy ? "THEIR " : "YOUR ") + r.SunkShip.ToString().ToUpperInvariant() + "!",
+            FireOutcome.Miss => T("MISS"),
+            FireOutcome.Hit => T("HIT!"),
+            FireOutcome.Sunk => string.Format(T("SUNK {0} {1}!"), T(atEnemy ? "THEIR" : "YOUR"), T(r.SunkShip.ToString().ToUpperInvariant())),
             _ => ""
         };
         private static Orientation Flip(Orientation o) => o == Orientation.Horizontal ? Orientation.Vertical : Orientation.Horizontal;
@@ -758,6 +792,8 @@ namespace Battleship
             if (match == null) NewGame();
             EnsureStyles();
             if (shipTex == null) LoadArt();
+
+            if (phase == Phase.Menu) { DrawHomeMenu(Event.current); return; }
 
             bool showTarget = (targeting && phase == Phase.Playing) || phase == Phase.Over;
             bool console = consoleTex != null && phase == Phase.Playing; // the shell wraps BOTH play views
@@ -857,8 +893,18 @@ namespace Battleship
             if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Space)
             { paused = !paused; Time.timeScale = paused ? 0f : 1f; AudioListener.pause = paused; e.Use(); }
 
-            if (phase == Phase.Setup) { DrawBoardBase(boardX, boardY); DrawPlacedShips(boardX, boardY); HandleBoardDrag(boardX, boardY, e, mp); }
-            else if (showTarget)
+            if (phase == Phase.Setup)
+            {
+                DrawFleetSetup(e, mp);          // full framed setup screen (backdrop + grid + dock + controls)
+                if (debugMenu) DrawDebugMenu();
+                if (e.type == EventType.Repaint && cursorTex != null)
+                {
+                    float chS = Mathf.Max(18f, Screen.height * 0.03f);
+                    GUI.DrawTexture(new Rect(e.mousePosition.x, e.mousePosition.y, chS * cursorTex.width / cursorTex.height, chS), cursorTex, ScaleMode.StretchToFill);
+                }
+                return;
+            }
+            if (showTarget)
             {
                 if (console)
                 {
@@ -877,7 +923,7 @@ namespace Battleship
                         }
                         var hr = new Rect(Screen.width * 0.252f, Screen.height * 0.008f, Screen.width * 0.492f, Screen.height * 0.046f);
                         radarTitle.fontSize = Mathf.Max(10, Mathf.RoundToInt(hr.height * 0.5f));
-                        GUI.Label(hr, "TACTICAL RADAR", radarTitle);
+                        GUI.Label(hr, T("TACTICAL RADAR"), radarTitle);
                         DrawLegendPanel(); // radar keeps its original right column: legend + status
                         DrawStatusPanel();
                         DrawFleetLeds();
@@ -948,7 +994,7 @@ namespace Battleship
                         }
                         var hr2 = new Rect(Screen.width * 0.252f, Screen.height * 0.008f, Screen.width * 0.492f, Screen.height * 0.046f);
                         radarTitle.fontSize = Mathf.Max(10, Mathf.RoundToInt(hr2.height * 0.5f));
-                        GUI.Label(hr2, "YOUR FLEET", radarTitle);
+                        GUI.Label(hr2, T("YOUR FLEET"), radarTitle);
                         DrawStatusPanel(); // mid recess under the cards — same readout as the radar side
                         DrawFleetLeds();
                         DrawMessageStrip();
@@ -972,6 +1018,577 @@ namespace Battleship
                 float cwS = chS * cursorTex.width / cursorTex.height;
                 GUI.DrawTexture(new Rect(e.mousePosition.x, e.mousePosition.y, cwS, chS), cursorTex, ScaleMode.StretchToFill);
             }
+        }
+
+        // Home menu — the first screen on launch. The MainMenu.png art (title, ships, radar sweep,
+        // waves, version) is the backdrop; the four empty button plates baked into it get live labels
+        // + click handling overlaid here. OnGUI returns right after this in Menu phase.
+        private void DrawHomeMenu(Event e)
+        {
+            float W = Screen.width, H = Screen.height;
+
+            // backdrop — the whole art stretched over the window (art is authored ~16:9)
+            if (e.type == EventType.Repaint)
+            {
+                if (menuTex != null) GUI.DrawTexture(new Rect(0, 0, W, H), menuTex, ScaleMode.StretchToFill);
+                else { Color pc = GUI.color; GUI.color = new Color(0.05f, 0.12f, 0.19f); GUI.DrawTexture(new Rect(0, 0, W, H), Texture2D.whiteTexture); GUI.color = pc; }
+            }
+
+            // settings overlay takes over input while open — the menu buttons underneath stay inert
+            if (settingsOpen) { DrawSettings(e); return; }
+
+            // the four button plates, measured off the art as fractions of the frame.
+            // xL/xR = plate span, top of the first plate, and the top-to-top step down the stack.
+            const float xL = 0.3725f, xR = 0.6290f, plateTop = 0.410f, plateH = 0.092f, step = 0.1250f;
+            var items = new (string label, System.Action act)[]
+            {
+                ("PLAY",        () => { Sfx(clipFlip, 0.9f); NewGame(); }),                 // fresh boards → Setup
+                ("MULTIPLAYER", () => MenuNote("MULTIPLAYER — COMING SOON")),
+                ("SETTINGS",    () => { Sfx(clipClick, 0.7f); settingsOpen = true; activeSlider = -1; }),
+                ("QUIT",        () => { Sfx(clipClick, 0.7f); QuitGame(); }),
+            };
+
+            var lbl = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter };
+            float rx = xL * W, rw = (xR - xL) * W, rh = plateH * H;
+            for (int i = 0; i < items.Length; i++)
+            {
+                var r = new Rect(rx, (plateTop + step * i) * H, rw, rh);
+                bool hot = r.Contains(e.mousePosition);
+
+                if (e.type == EventType.Repaint)
+                {
+                    Color pc = GUI.color;
+                    if (hot) // phosphor-green wash + brighter frame kiss so the plate reads as selected
+                    {
+                        GUI.color = new Color(0.30f, 0.85f, 0.45f, 0.16f);
+                        GUI.DrawTexture(r, Texture2D.whiteTexture);
+                    }
+                    GUI.color = pc;
+                    lbl.fontSize = Mathf.RoundToInt(Mathf.Clamp(rh * 0.42f, 12f, 34f));
+                    lbl.normal.textColor = hot ? new Color(0.62f, 1f, 0.72f) : new Color(0.82f, 0.90f, 0.97f);
+                    GUI.Label(r, T(items[i].label), lbl);
+                }
+
+                if (GUI.Button(r, GUIContent.none, GUIStyle.none)) items[i].act();
+            }
+
+            // transient status line (coming-soon toasts), just under the button stack
+            if (e.type == EventType.Repaint && Time.time < menuNoteUntil && !string.IsNullOrEmpty(menuNote))
+            {
+                var ns = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter };
+                ns.fontSize = Mathf.RoundToInt(Mathf.Clamp(H * 0.022f, 10f, 20f));
+                ns.normal.textColor = new Color(0.45f, 0.72f, 0.88f, 0.9f);
+                GUI.Label(new Rect(rx - rw * 0.2f, (plateTop + step * items.Length + 0.01f) * H, rw * 1.4f, H * 0.05f), T(menuNote), ns);
+            }
+
+            // software cursor — OnGUI's own cursor pass is skipped in Menu phase, so draw it here
+            if (e.type == EventType.Repaint && cursorTex != null)
+            {
+                float chS = Mathf.Max(18f, H * 0.03f);
+                float cwS = chS * cursorTex.width / cursorTex.height;
+                GUI.DrawTexture(new Rect(e.mousePosition.x, e.mousePosition.y, cwS, chS), cursorTex, ScaleMode.StretchToFill);
+            }
+        }
+
+        private void MenuNote(string m) { Sfx(clipClick, 0.7f); menuNote = m; menuNoteUntil = Time.time + 2.2f; }
+
+        // Fleet-placement screen — the FleetPlacement.png art (board frame, empty ship dock, empty
+        // chip/button plates) is the backdrop; the live 10×10 grid, ship dock, difficulty chips and
+        // control buttons are overlaid on the baked zones by normalized coords (same method as the
+        // home menu). The art is LETTERBOXED to its native aspect so the plates line up at any window
+        // size and the pixel art never stretches. All text is drawn live via T() so it stays EN/FR.
+        // OnGUI returns right after this in Setup phase. Zone constants were measured off the art.
+        private void DrawFleetSetup(Event e, Vector2 mp)
+        {
+            float W = Screen.width, H = Screen.height;
+
+            // aspect-fit the art into the window, centred, dark bars filling any leftover margin
+            float aspect = 4096f / 2288f;
+            Rect art = (W / H > aspect)
+                ? new Rect((W - H * aspect) * 0.5f, 0f, H * aspect, H)
+                : new Rect(0f, (H - W / aspect) * 0.5f, W, W / aspect);
+
+            if (e.type == EventType.Repaint)
+            {
+                Color pc = GUI.color;
+                GUI.color = new Color(0.03f, 0.06f, 0.09f);
+                GUI.DrawTexture(new Rect(0, 0, W, H), Texture2D.whiteTexture);          // letterbox bars
+                GUI.color = pc;
+                if (fleetSetupTex != null) GUI.DrawTexture(art, fleetSetupTex, ScaleMode.StretchToFill);
+                else { GUI.color = new Color(0.05f, 0.12f, 0.19f); GUI.DrawTexture(art, Texture2D.whiteTexture); GUI.color = pc; }
+            }
+
+            // --- board: reserve a status band at the top of the screen glass; the grid fills the rest ---
+            var glass = NRect(0.075f, 0.130f, 0.400f, 0.720f, art);
+            float stripH = glass.height * 0.095f;
+            var bz = new Rect(glass.x, glass.y + stripH, glass.width, glass.height - stripH);
+            cs = Mathf.Floor(Mathf.Max(6f, Mathf.Min(bz.width, bz.height) / Board.Size));
+            float bw = cs * Board.Size;
+            boardX = Mathf.Floor(bz.x + (bz.width - bw) * 0.5f);
+            boardY = Mathf.Floor(bz.y + (bz.height - bw) * 0.5f);
+            DrawBoardBase(boardX, boardY);
+            DrawPlacedShips(boardX, boardY);
+            HandleBoardDrag(boardX, boardY, e, mp);
+
+            // status band ABOVE the grid (never over a cell) — drag hint + placement feedback
+            if (e.type == EventType.Repaint && !string.IsNullOrEmpty(message))
+            {
+                var mr = new Rect(boardX, glass.y + stripH * 0.12f, bw, stripH * 0.76f);
+                Color pc = GUI.color;
+                GUI.color = new Color(0f, 0.02f, 0.03f, 0.55f);
+                GUI.DrawTexture(mr, Texture2D.whiteTexture);
+                GUI.color = pc;
+                var ms = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter };
+                ms.normal.textColor = new Color(0.45f, 0.95f, 0.55f);
+                ms.fontSize = FitFont(ms, T(message), mr.width * 0.94f, Mathf.RoundToInt(mr.height * 0.6f), 8);
+                GUI.Label(mr, T(message), ms);
+            }
+
+            // --- title plate (top-right) ---
+            if (e.type == EventType.Repaint)
+            {
+                var tr = NRect(0.590f, 0.049f, 0.383f, 0.100f, art);
+                var ts = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter };
+                ts.normal.textColor = new Color(0.62f, 1f, 0.72f);
+                ts.fontSize = FitFont(ts, T("PLACE YOUR FLEET"), tr.width * 0.9f, Mathf.RoundToInt(tr.height * 0.5f), 8);
+                GUI.Label(tr, T("PLACE YOUR FLEET"), ts);
+            }
+
+            FleetDock(e, mp, art);
+
+            // --- difficulty row (3 wide toggles) + control row (3 wide buttons); one shared font ---
+            var levels = new[] { BattleshipAI.Level.Easy, BattleshipAI.Level.Medium, BattleshipAI.Level.Hard };
+            float[] col = { 0.590f, 0.7125f, 0.840f };
+            float[] colW = { 0.108f, 0.110f, 0.110f };
+            const float diffY = 0.727f, ctrlY = 0.856f, rowH = 0.080f;
+            var diffR = new Rect[3]; var ctrlR = new Rect[3];
+            for (int i = 0; i < 3; i++) { diffR[i] = NRect(col[i], diffY, colW[i], rowH, art); ctrlR[i] = NRect(col[i], ctrlY, colW[i], rowH, art); }
+
+            string[] diffLbl = { T("Easy").ToUpperInvariant(), T("Medium").ToUpperInvariant(), T("Hard").ToUpperInvariant() };
+            string[] ctrlLbl = { T("RANDOM"), T("CLEAR"), T("START") };
+            int rowFont = SharedFont(new[] { diffR[0], diffR[1], diffR[2], ctrlR[0], ctrlR[1], ctrlR[2] },
+                                     new[] { diffLbl[0], diffLbl[1], diffLbl[2], ctrlLbl[0], ctrlLbl[1], ctrlLbl[2] },
+                                     Mathf.RoundToInt(diffR[0].height * 0.42f), 7);
+
+            // per-button text nudges (fraction of plate): (x right+, y down+) — dialed in by eye
+            Vector2[] diffOff = { new Vector2(-0.03f, 0.14f), new Vector2(0.05f, 0.09f), new Vector2(0.08f, 0.09f) };
+            Vector2[] ctrlOff = { new Vector2(-0.03f, 0.14f), new Vector2(0f, 0.14f), new Vector2(0.08f, 0.14f) };
+            for (int i = 0; i < 3; i++)
+            {
+                int li = i;
+                SetupButton(diffR[i], diffLbl[i], rowFont, true, difficulty == levels[i], diffOff[i], e, mp,
+                    () => { if (difficulty != levels[li]) { difficulty = levels[li]; NewGame(); Sfx(clipClick, 0.7f); } });
+            }
+            SetupButton(ctrlR[0], ctrlLbl[0], rowFont, true, false, ctrlOff[0], e, mp, () => { RandomizeFleet(); Sfx(clipClick, 0.7f); });
+            SetupButton(ctrlR[1], ctrlLbl[1], rowFont, true, false, ctrlOff[1], e, mp, () => { for (int i = 0; i < fleet.Length; i++) fleet[i].placed = false; dragIdx = -1; Sfx(clipClick, 0.7f); });
+            SetupButton(ctrlR[2], ctrlLbl[2], rowFont, AllPlaced(), false, ctrlOff[2], e, mp,
+                () => { Sfx(clipFlip, 0.8f); SyncBoard(); phase = Phase.Playing; targeting = false; message = "Your turn — tap TARGET to fire."; });
+        }
+
+        // the 5-ship dock (right panel, middle): each unplaced ship sits in a berth, click to pick up
+        private void FleetDock(Event e, Vector2 mp, Rect art)
+        {
+            var rack = NRect(0.6125f, 0.219f, 0.345f, 0.448f, art);
+            float slotH = rack.height / fleet.Length;
+            for (int i = 0; i < fleet.Length; i++)
+            {
+                var slot = new Rect(rack.x, rack.y + i * slotH, rack.width, slotH);
+                if (fleet[i].placed || i == dragIdx) continue; // deployed / in-hand → empty berth
+                bool hot = slot.Contains(mp);
+                int len = Ships.Length(fleet[i].type);
+                if (e.type == EventType.Repaint)
+                {
+                    if (hot)
+                    {
+                        Color pc = GUI.color;
+                        GUI.color = new Color(0.30f, 0.85f, 0.45f, 0.16f);
+                        GUI.DrawTexture(slot, Texture2D.whiteTexture);
+                        GUI.color = pc;
+                    }
+                    // inset inside the baked berth border, then split into sprite (left) + name (right)
+                    float ix = slot.x + slot.width * 0.05f, iw = slot.width * 0.90f;
+                    float pad = slot.height * 0.16f;
+                    // shorter hulls render tall and kiss the top edge — nudge them down (destroyer most)
+                    float yNudge = fleet[i].type == ShipType.Destroyer ? slot.height * 0.20f
+                                 : fleet[i].type == ShipType.Submarine ? slot.height * 0.12f : 0f;
+                    var tex = shipTex != null ? shipTex[(int)fleet[i].type] : null;
+                    var sr = new Rect(ix, slot.y + pad + yNudge, iw * 0.50f, slot.height - 2f * pad);
+                    if (tex != null) GUI.DrawTexture(sr, tex, ScaleMode.ScaleToFit);
+                    else for (int k = 0; k < len; k++) Fill(new Rect(sr.x + k * (sr.height + 2f), sr.y, sr.height, sr.height), ShipCol, "");
+                    float nameX = ix + iw * 0.54f, nameW = iw * 0.46f;
+                    // match the name to the lowered sprite for the short hulls
+                    float nameNudge = fleet[i].type == ShipType.Destroyer ? slot.height * 0.16f
+                                    : fleet[i].type == ShipType.Submarine ? slot.height * 0.08f : 0f;
+                    var ns = new GUIStyle(small) { alignment = TextAnchor.MiddleLeft };
+                    ns.normal.textColor = hot ? new Color(0.62f, 1f, 0.72f) : new Color(0.80f, 0.90f, 0.85f);
+                    ns.fontSize = FitFont(ns, T(fleet[i].type.ToString()), nameW, Mathf.RoundToInt(slot.height * 0.30f), 6);
+                    GUI.Label(new Rect(nameX, slot.y + nameNudge, nameW, slot.height), T(fleet[i].type.ToString()), ns);
+                }
+                if (e.type == EventType.MouseDown && e.button == 0 && dragIdx < 0 && slot.Contains(mp))
+                { dragIdx = i; orient = Orientation.Horizontal; message = "Right-click to rotate"; Sfx(clipClick, 0.5f); e.Use(); }
+            }
+        }
+
+        // one baked button plate: live label + hover wash + click. `active` = persistent green
+        // selected state (used by the difficulty toggles); dimmed & inert when !enabled.
+        private void SetupButton(Rect r, string label, int fontSize, bool enabled, bool active, Vector2 labelOff, Event e, Vector2 mp, System.Action act)
+        {
+            bool hot = enabled && r.Contains(mp);
+            if (e.type == EventType.Repaint)
+            {
+                Color pc = GUI.color;
+                // fill is inset well inside the baked plate so the wash never spills over its edge;
+                // disabled draws NO box (would show as an ugly dark rectangle) — only the label dims
+                if (active || hot)
+                {
+                    var f = new Rect(r.x + r.width * 0.06f, r.y + r.height * 0.16f, r.width * 0.88f, r.height * 0.68f);
+                    GUI.color = active ? new Color(0.32f, 0.88f, 0.48f, 0.42f) : new Color(0.30f, 0.85f, 0.45f, 0.15f);
+                    GUI.DrawTexture(f, Texture2D.whiteTexture);
+                    GUI.color = pc;
+                }
+                var ls = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter };
+                ls.normal.textColor = !enabled ? new Color(0.50f, 0.60f, 0.64f, 0.55f)
+                                     : active   ? new Color(0.72f, 1f, 0.80f)
+                                     : hot       ? new Color(0.62f, 1f, 0.72f)
+                                                 : new Color(0.82f, 0.90f, 0.97f);
+                ls.fontSize = fontSize;
+                // labelOff nudges only the text (fraction of the plate), leaving the hit-box aligned
+                GUI.Label(new Rect(r.x + labelOff.x * r.width, r.y + labelOff.y * r.height, r.width, r.height), label, ls);
+            }
+            if (enabled && GUI.Button(r, GUIContent.none, GUIStyle.none)) act();
+        }
+
+        // smallest fitting fontSize across several plates, so a row of buttons shares one size
+        private int SharedFont(Rect[] rects, string[] labels, int hi, int lo)
+        {
+            var st = new GUIStyle(hdr);
+            int best = hi;
+            for (int i = 0; i < labels.Length; i++)
+                best = Mathf.Min(best, FitFont(st, labels[i], rects[i].width * 0.88f, hi, lo));
+            return best;
+        }
+
+        // pixel font can't be squeezed by GUIStyle, so shrink fontSize until the text fits maxW
+        private int FitFont(GUIStyle st, string text, float maxW, int hi, int lo)
+        {
+            for (int s = hi; s > lo; s--)
+            {
+                st.fontSize = s;
+                if (st.CalcSize(new GUIContent(text)).x <= maxW) return s;
+            }
+            return Mathf.Max(lo, 1);
+        }
+
+        // build a Rect from normalized x/y/w/h within an art Rect (letterboxed surface)
+        private static Rect NRect(float nx, float ny, float nw, float nh, Rect a)
+            => new Rect(a.x + nx * a.width, a.y + ny * a.height, nw * a.width, nh * a.height);
+
+        private void QuitGame()
+        {
+            Application.Quit();
+#if UNITY_EDITOR
+            UnityEditor.EditorApplication.isPlaying = false;
+#endif
+        }
+
+        // --- Localization -------------------------------------------------------
+        // T(en) returns the active language's string for an English key. French is
+        // written accent-free (ASCII): the pixel font is all-caps and DrawMessageStrip
+        // drops any char >= 127, so accents would vanish anyway. Unknown keys fall
+        // back to the English text, so a missing entry degrades gracefully.
+        private string T(string en)
+        {
+            if (lang == Lang.EN || en == null) return en;
+            return FR.TryGetValue(en, out var v) ? v : en;
+        }
+
+        private static readonly System.Collections.Generic.Dictionary<string, string> FR = new()
+        {
+            // home menu + settings
+            { "PLAY", "JOUER" }, { "MULTIPLAYER", "MULTIJOUEUR" }, { "SETTINGS", "OPTIONS" }, { "QUIT", "QUITTER" },
+            { "MULTIPLAYER — COMING SOON", "MULTIJOUEUR — BIENTOT DISPONIBLE" },
+            { "MUSIC", "MUSIQUE" }, { "SFX", "EFFETS" }, { "LANGUAGE", "LANGUE" }, { "◀ BACK", "◀ RETOUR" },
+            // panel headers ("BATTLESHIP" title is handled inline — it collides with the ship name key below)
+            { "YOU WIN!", "VOUS GAGNEZ !" }, { "AI WINS", "L'IA GAGNE" },
+            { "PLACE YOUR FLEET", "PLACEZ VOTRE FLOTTE" }, { "TARGETING", "CIBLAGE" }, { "YOUR FLEET", "VOTRE FLOTTE" },
+            { "TACTICAL RADAR", "RADAR TACTIQUE" },
+            // main action buttons
+            { "🎯 TARGET ▶", "🎯 CIBLER ▶" }, { "◀ MY FLEET", "◀ MA FLOTTE" },
+            { "⏱ TURN TIMER: {0}s", "⏱ TEMPS DU TOUR : {0}s" }, { "⏭ END TURN", "⏭ FIN DU TOUR" },
+            { "⏳ END TURN ({0}s)", "⏳ FIN DU TOUR ({0}s)" }, { "⏳ END TURN", "⏳ FIN DU TOUR" },
+            { "Enemy ships: {0} / 5", "Navires ennemis : {0} / 5" }, { "Your ships: {0} / 5", "Vos navires : {0} / 5" },
+            { "PERKS", "ATOUTS" }, { "New Game", "Nouvelle partie" },
+            // perk panel buttons (with pick-target variants)
+            { "🚤 RELOCATE ◀ pick a spot", "🚤 DEPLACER ◀ choisir un lieu" }, { "🚤 RELOCATE", "🚤 DEPLACER" },
+            { "📡 RADAR SCOUT", "📡 RADAR ECLAIREUR" },
+            { "☄ SCORCH ARMED ✓", "☄ BRULURE ARMEE ✓" }, { "☄ SCORCH", "☄ BRULURE" },
+            { "🛡 INTERCEPT ◀ pick a cell", "🛡 INTERCEPTION ◀ choisir une case" }, { "🛡 INTERCEPT", "🛡 INTERCEPTION" },
+            { "🐟 TORPEDO ◀ pick a lane", "🐟 TORPILLE ◀ choisir une colonne" }, { "🐟 TORPEDO", "🐟 TORPILLE" },
+            // fleet-placement screen (framed setup) — short labels sized to the baked plates
+            { "RANDOM", "ALEATOIRE" }, { "CLEAR", "EFFACER" }, { "START", "DEMARRER" },
+            { "Right-click to rotate", "Clic droit pour pivoter" },
+            // setup panel (legacy text panel — kept for reference)
+            { "AI Difficulty", "Difficulte IA" }, { "Rotate (R)", "Pivoter (R)" }, { "Randomize", "Aleatoire" },
+            { "Clear", "Effacer" }, { "▶ Start", "▶ Demarrer" }, { "Drag ships to the board:", "Glissez les navires sur la grille :" },
+            { "Easy", "Facile" }, { "Medium", "Moyen" }, { "Hard", "Difficile" },
+            // ship names (tray, mixed case)
+            { "Carrier", "Porte-avions" }, { "Battleship", "Cuirasse" }, { "Cruiser", "Croiseur" },
+            { "Submarine", "Sous-marin" }, { "Destroyer", "Destroyer" },
+            // ship names (uppercase, used in "SUNK THEIR ..." lines)
+            { "CARRIER", "PORTE-AVIONS" }, { "BATTLESHIP", "CUIRASSE" }, { "CRUISER", "CROISEUR" },
+            { "SUBMARINE", "SOUS-MARIN" }, { "DESTROYER", "DESTROYER" },
+            // radar legend
+            { "* LEGEND *", "* LEGENDE *" },
+            { "HIT", "TOUCHE" }, { "Ship hit", "Navire touche" },
+            { "DESTROYED", "DETRUIT" }, { "Ship sunk", "Navire coule" },
+            { "MISS", "MANQUE" }, { "Nothing here", "Rien ici" },
+            { "RECON", "RECON" }, { "Enemy ship detected", "Navire ennemi detecte" },
+            // status panel
+            { "SHOTS FIRED", "TIRS EFFECTUES" }, { "HITS", "TOUCHES" }, { "SHIPS SUNK", "NAVIRES COULES" },
+            { "STATUS", "STATUT" }, { "TURN-END", "FIN TOUR" }, { "END TURN", "FIN DU TOUR" },
+            // perk cards
+            { "SCOUT", "ECLAIREUR" }, { "LAUNCH A PLANE SCOUT.", "LANCER UN AVION ECLAIREUR." },
+            { "INTERCEPT", "INTERCEPTION" }, { "INTERCEPT ENEMY MISSILE.", "INTERCEPTER UN MISSILE ENNEMI." },
+            { "SCORCH", "BRULURE" }, { "MULTIPLE FIRING MISSILE.", "TIR MISSILE MULTIPLE." },
+            { "TORPEDO", "TORPILLE" }, { "LAUNCH A TORPEDO.", "LANCER UNE TORPILLE." },
+            { "RELOCATE", "DEPLACER" }, { "MOVE A SHIP TO A NEW POSITION.", "DEPLACER UN NAVIRE AILLEURS." },
+            { "PICK A CELL TO SHIELD.", "CHOISIR UNE CASE A PROTEGER." }, { "PICK A LANE.", "CHOISIR UNE COLONNE." },
+            { "PICK A SPOT.", "CHOISIR UN EMPLACEMENT." }, { "ARMED — NEXT SALVO x2.", "ARMEE — PROCHAINE SALVE x2." },
+            { "OFFLINE", "HORS LIGNE" }, { "ARMED", "ARMEE" }, { "READY", "PRETE" },
+            // combat result fragments (composed with coordinates)
+            { "INTERCEPTED!", "INTERCEPTE !" }, { "HIT!", "TOUCHE !" },
+            { "SUNK {0} {1}!", "COULE {0} {1} !" }, { "THEIR", "LEUR" }, { "YOUR", "VOTRE" },
+            // transient status messages
+            { "Click a ship, move, click the grid to drop it.", "Cliquez un navire, deplacez, cliquez la grille pour le poser." },
+            { "🚀 INCOMING FIRE...", "🚀 TIR ENNEMI EN APPROCHE..." },
+            { "🐟 ENEMY TORPEDO INBOUND...", "🐟 TORPILLE ENNEMIE EN APPROCHE..." },
+            { "THEIR DAMAGED SHIP ESCAPED!", "LEUR NAVIRE ENDOMMAGE S'EST ECHAPPE !" },
+            { "🛦 ENEMY RECON PLANE OVERHEAD!", "🛦 AVION DE RECON ENNEMI EN VUE !" },
+            { "ENEMY TORPEDO: NO HIT.", "TORPILLE ENNEMIE : AUCUN IMPACT." },
+            { "YOUR FLEET IS DESTROYED — AI WINS.", "VOTRE FLOTTE EST DETRUITE — L'IA GAGNE." },
+            { "ENEMY FLEET DESTROYED — YOU WIN!", "FLOTTE ENNEMIE DETRUITE — VOUS GAGNEZ !" },
+            { "🐟 TORPEDO AWAY...", "🐟 TORPILLE LANCEE..." },
+            { "TORPEDO: NO CONTACT.", "TORPILLE : AUCUN CONTACT." },
+            { "TORPEDO INTERCEPTED!", "TORPILLE INTERCEPTEE !" },
+            { "SALVO AWAY...", "SALVE LANCEE..." }, { "FIRING {0}...", "TIR SUR {0}..." },
+            { "📡 CONTACT AT {0}!", "📡 CONTACT EN {0} !" },
+            { "Returned to tray.", "Remis dans la reserve." }, { "Placed {0}.", "{0} place." },
+            { "Fleet ready — press ▶ Start!", "Flotte prete — appuyez sur ▶ Demarrer !" },
+            { "Your turn — tap TARGET to fire.", "A vous — appuyez sur CIBLER pour tirer." },
+            { "No navigable route there — the fleet blocks the way.", "Aucune route navigable — la flotte bloque le passage." },
+            { "Destroyer relocated — the enemy's markers just went stale!", "Destroyer deplace — les marqueurs ennemis sont perimes !" },
+            { "Can't relocate there.", "Deplacement impossible ici." },
+            { "Counter-missile battery locked on {0}.", "Batterie anti-missile verrouillee sur {0}." },
+            { "Can't protect that cell (already shot, or it's the cruiser's fire-control center).", "Impossible de proteger cette case (deja tiree, ou centre de conduite de tir du croiseur)." },
+            { "⏰ TIME UP — TURN FORFEITED.", "⏰ TEMPS ECOULE — TOUR PERDU." },
+            { "NO NEW CONTACTS.", "AUCUN NOUVEAU CONTACT." },
+            { "📡 RECON PLANE LAUNCHED...", "📡 AVION DE RECON LANCE..." },
+        };
+
+        private void CloseSettings()
+        {
+            // persist the chosen levels so they survive a restart
+            PlayerPrefs.SetFloat("pk_sfxVol", sfxVolume);
+            PlayerPrefs.SetFloat("pk_musicVol", musicVolume);
+            PlayerPrefs.SetInt("pk_lang", (int)lang);
+            PlayerPrefs.Save();
+            settingsOpen = false; activeSlider = -1;
+            Sfx(clipFlip, 0.8f);
+        }
+
+        // SETTINGS panel — overlaid on the dimmed home menu; music keeps playing behind it
+        private void DrawSettings(Event e)
+        {
+            float W = Screen.width, H = Screen.height;
+
+            // ESC backs out, same as the BACK button
+            if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape) { CloseSettings(); e.Use(); }
+
+            // dim the menu art behind the panel
+            if (e.type == EventType.Repaint)
+            {
+                Color pc = GUI.color;
+                GUI.color = new Color(0.02f, 0.05f, 0.09f, 0.72f);
+                GUI.DrawTexture(new Rect(0, 0, W, H), Texture2D.whiteTexture);
+                GUI.color = pc;
+            }
+
+            float pw = Mathf.Min(W * 0.62f, 760f);
+            float ph = Mathf.Min(H * 0.58f, 520f);
+            float px = (W - pw) * 0.5f, py = (H - ph) * 0.5f;
+            var panel = new Rect(px, py, pw, ph);
+
+            if (e.type == EventType.Repaint)
+            {
+                Color pc = GUI.color;
+                GUI.color = new Color(0.05f, 0.11f, 0.17f, 0.97f);          // console body
+                GUI.DrawTexture(panel, Texture2D.whiteTexture);
+                GUI.color = new Color(0.30f, 0.85f, 0.45f, 0.55f);          // phosphor-green frame
+                DrawFrame(panel, Mathf.Max(2f, H * 0.003f));
+                GUI.color = pc;
+            }
+
+            float pad = pw * 0.07f;
+            float innerX = px + pad, innerW = pw - pad * 2f;
+
+            // title
+            if (e.type == EventType.Repaint)
+            {
+                var ts = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter };
+                ts.fontSize = Mathf.RoundToInt(Mathf.Clamp(H * 0.038f, 14f, 30f));
+                ts.normal.textColor = new Color(0.72f, 1f, 0.82f);
+                GUI.Label(new Rect(px, py + ph * 0.06f, pw, ph * 0.16f), T("SETTINGS"), ts);
+            }
+
+            float rowH = ph * 0.15f;
+            float rowGap = ph * 0.035f;
+            float firstRowY = py + ph * 0.24f;
+
+            musicVolume = SettingsRow(e, T("MUSIC"), musicVolume, 0,
+                new Rect(innerX, firstRowY, innerW, rowH));
+            sfxVolume = SettingsRow(e, T("SFX"), sfxVolume, 1,
+                new Rect(innerX, firstRowY + rowH + rowGap, innerW, rowH));
+            LanguageRow(e, new Rect(innerX, firstRowY + 2f * (rowH + rowGap), innerW, rowH));
+
+            // BACK button
+            float bw = innerW * 0.42f, bh = ph * 0.15f;
+            var backR = new Rect(px + (pw - bw) * 0.5f, py + ph - bh - ph * 0.07f, bw, bh);
+            bool bhot = backR.Contains(e.mousePosition);
+            if (e.type == EventType.Repaint)
+            {
+                Color pc = GUI.color;
+                GUI.color = bhot ? new Color(0.30f, 0.85f, 0.45f, 0.22f) : new Color(0.20f, 0.30f, 0.40f, 0.30f);
+                GUI.DrawTexture(backR, Texture2D.whiteTexture);
+                GUI.color = new Color(0.30f, 0.85f, 0.45f, bhot ? 0.75f : 0.40f);
+                DrawFrame(backR, 2f);
+                GUI.color = pc;
+                var bs = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter };
+                bs.fontSize = Mathf.RoundToInt(Mathf.Clamp(bh * 0.34f, 11f, 22f));
+                bs.normal.textColor = bhot ? new Color(0.62f, 1f, 0.72f) : new Color(0.82f, 0.90f, 0.97f);
+                GUI.Label(backR, T("◀ BACK"), bs);
+            }
+            if (GUI.Button(backR, GUIContent.none, GUIStyle.none)) CloseSettings();
+
+            // release any active drag when the mouse comes up anywhere
+            if (e.type == EventType.MouseUp && activeSlider != -1)
+            {
+                if (activeSlider == 1) Sfx(clipClick, 0.7f); // audition the new SFX level
+                activeSlider = -1;
+            }
+
+            // software cursor (this method returns before DrawHomeMenu's own cursor pass)
+            if (e.type == EventType.Repaint && cursorTex != null)
+            {
+                float chS = Mathf.Max(18f, H * 0.03f);
+                float cwS = chS * cursorTex.width / cursorTex.height;
+                GUI.DrawTexture(new Rect(e.mousePosition.x, e.mousePosition.y, cwS, chS), cursorTex, ScaleMode.StretchToFill);
+            }
+        }
+
+        // one labelled slider row; returns the (possibly updated) value
+        private float SettingsRow(Event e, string label, float value, int id, Rect row)
+        {
+            float labelW = row.width * 0.26f;
+            float valW = row.width * 0.12f;
+            var track = new Rect(row.x + labelW, row.y + row.height * 0.38f,
+                                 row.width - labelW - valW, row.height * 0.24f);
+
+            // drag handling — grab on the whole track height for an easy target
+            var grab = new Rect(track.x, row.y, track.width, row.height);
+            if (e.type == EventType.MouseDown && grab.Contains(e.mousePosition))
+            { activeSlider = id; e.Use(); }
+            if (activeSlider == id && (e.type == EventType.MouseDrag || e.type == EventType.MouseDown))
+            {
+                value = Mathf.Clamp01((e.mousePosition.x - track.x) / track.width);
+                e.Use();
+            }
+
+            if (e.type == EventType.Repaint)
+            {
+                Color pc = GUI.color;
+
+                var ls = new GUIStyle(hdr) { alignment = TextAnchor.MiddleLeft };
+                ls.fontSize = Mathf.RoundToInt(Mathf.Clamp(row.height * 0.34f, 11f, 22f));
+                ls.normal.textColor = new Color(0.82f, 0.90f, 0.97f);
+                GUI.Label(new Rect(row.x, row.y, labelW, row.height), label, ls);
+
+                GUI.color = new Color(0.10f, 0.18f, 0.26f, 0.95f);          // track groove
+                GUI.DrawTexture(track, Texture2D.whiteTexture);
+                var fill = new Rect(track.x, track.y, track.width * value, track.height);
+                GUI.color = new Color(0.30f, 0.85f, 0.45f, 0.85f);          // filled portion
+                GUI.DrawTexture(fill, Texture2D.whiteTexture);
+                GUI.color = new Color(0.30f, 0.85f, 0.45f, 0.45f);
+                DrawFrame(track, 1.5f);
+
+                float thumbW = Mathf.Max(8f, track.height * 0.9f);          // draggable knob
+                var thumb = new Rect(track.x + track.width * value - thumbW * 0.5f,
+                                     track.y - track.height * 0.55f, thumbW, track.height * 2.1f);
+                GUI.color = (activeSlider == id) ? new Color(0.72f, 1f, 0.82f) : new Color(0.55f, 0.92f, 0.68f);
+                GUI.DrawTexture(thumb, Texture2D.whiteTexture);
+
+                var vs = new GUIStyle(hdr) { alignment = TextAnchor.MiddleRight };
+                vs.fontSize = Mathf.RoundToInt(Mathf.Clamp(row.height * 0.30f, 10f, 20f));
+                vs.normal.textColor = new Color(0.62f, 1f, 0.72f);
+                GUI.Label(new Rect(row.x + row.width - valW, row.y, valW, row.height),
+                          Mathf.RoundToInt(value * 100f) + "%", vs);
+
+                GUI.color = pc;
+            }
+            return value;
+        }
+
+        // LANGUAGE row: label on the left, an EN | FR segmented toggle on the right
+        private void LanguageRow(Event e, Rect row)
+        {
+            float labelW = row.width * 0.26f;
+            var opts = new (string txt, Lang val)[] { ("EN", Lang.EN), ("FR", Lang.FR) };
+            float segW = (row.width - labelW) * 0.5f;
+
+            for (int i = 0; i < opts.Length; i++)
+            {
+                var seg = new Rect(row.x + labelW + i * segW + (i == 0 ? 0f : 4f),
+                                   row.y + row.height * 0.18f, segW - 4f, row.height * 0.64f);
+                bool active = lang == opts[i].val;
+                bool hot = seg.Contains(e.mousePosition);
+
+                if (e.type == EventType.Repaint)
+                {
+                    Color pc = GUI.color;
+                    GUI.color = active ? new Color(0.30f, 0.85f, 0.45f, 0.55f)
+                              : hot    ? new Color(0.30f, 0.85f, 0.45f, 0.18f)
+                                       : new Color(0.10f, 0.18f, 0.26f, 0.85f);
+                    GUI.DrawTexture(seg, Texture2D.whiteTexture);
+                    GUI.color = new Color(0.30f, 0.85f, 0.45f, active ? 0.85f : 0.40f);
+                    DrawFrame(seg, active ? 2f : 1.5f);
+                    GUI.color = pc;
+
+                    var ss = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter };
+                    ss.fontSize = Mathf.RoundToInt(Mathf.Clamp(seg.height * 0.42f, 11f, 22f));
+                    ss.normal.textColor = active ? new Color(0.10f, 0.16f, 0.12f)
+                                        : hot    ? new Color(0.62f, 1f, 0.72f)
+                                                 : new Color(0.72f, 0.82f, 0.90f);
+                    GUI.Label(seg, opts[i].txt, ss);
+                }
+                if (GUI.Button(seg, GUIContent.none, GUIStyle.none) && lang != opts[i].val)
+                { lang = opts[i].val; Sfx(clipClick, 0.7f); }
+            }
+
+            if (e.type == EventType.Repaint)
+            {
+                var ls = new GUIStyle(hdr) { alignment = TextAnchor.MiddleLeft };
+                ls.fontSize = Mathf.RoundToInt(Mathf.Clamp(row.height * 0.34f, 11f, 22f));
+                ls.normal.textColor = new Color(0.82f, 0.90f, 0.97f);
+                GUI.Label(new Rect(row.x, row.y, labelW, row.height), T("LANGUAGE"), ls);
+            }
+        }
+
+        // 4-rect border stroke around r using the current GUI.color
+        private void DrawFrame(Rect r, float t)
+        {
+            GUI.DrawTexture(new Rect(r.x, r.y, r.width, t), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(r.x, r.yMax - t, r.width, t), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(r.x, r.y, t, r.height), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(r.xMax - t, r.y, t, r.height), Texture2D.whiteTexture);
         }
 
         // ESC window: every debug/dev lever in one place, drawn on top of whatever view is up
@@ -1044,7 +1661,7 @@ namespace Battleship
             float w = cs * 2.6f;
             var prev = GUI.backgroundColor;
             if (difficulty == d) GUI.backgroundColor = new Color(0.4f, 0.7f, 1f);
-            if (GUI.Button(new Rect(x, y, w, h), d.ToString(), btn) && difficulty != d) { difficulty = d; NewGame(); }
+            if (GUI.Button(new Rect(x, y, w, h), T(d.ToString()), btn) && difficulty != d) { difficulty = d; NewGame(); }
             GUI.backgroundColor = prev;
             return x + w + cs * 0.15f;
         }
@@ -1680,10 +2297,10 @@ namespace Battleship
                 if (ev.Result.Outcome == FireOutcome.Hit) { eImpact[ev.X, ev.Y] = at; QueueShake(at, 0.2f); QueueSfx(at, RandomHit()); }
                 if (ev.Result.Outcome == FireOutcome.Sunk) { eImpact[ev.X, ev.Y] = at; QueueShake(at, 0.35f); QueueSfx(at, RandomHit()); QueueSfx(at + 0.3f, clipSunk); }
                 if (ev.Result.Outcome == FireOutcome.Intercepted) { ctrEX = ev.X; ctrEY = ev.Y; ctrET = at; QueueShake(at, 0.25f); QueueSfx(at, clipIntercept); }
-                string part = ev.Result.Outcome == FireOutcome.Intercepted ? "INTERCEPTED!" : Describe(ev.Result, true);
+                string part = ev.Result.Outcome == FireOutcome.Intercepted ? T("INTERCEPTED!") : Describe(ev.Result, true);
                 msg += (i == 0 ? "" : "   ") + (n > 1 ? Coord(ev.X, ev.Y) + ": " : "") + part;
             }
-            message = n > 1 ? "SALVO AWAY..." : "FIRING " + Coord(gx, gy) + "...";  // action now, result on impact
+            message = n > 1 ? T("SALVO AWAY...") : string.Format(T("FIRING {0}..."), Coord(gx, gy));  // action now, result on impact
             QueueMsg(msg, settle);
             settle += 0.9f; // last shell's flight + boom settles
             actionEndT = settle;
@@ -1751,7 +2368,7 @@ namespace Battleship
             {
                 int cx = Mathf.FloorToInt((mp.x - ox) / cs), cy = Mathf.FloorToInt((mp.y - oy) / cs);
                 for (int i = 0; i < fleet.Length; i++)
-                    if (fleet[i].placed && InShip(i, cx, cy)) { dragIdx = i; orient = fleet[i].o; fleet[i].placed = false; e.Use(); break; }
+                    if (fleet[i].placed && InShip(i, cx, cy)) { dragIdx = i; orient = fleet[i].o; fleet[i].placed = false; message = "Right-click to rotate"; e.Use(); break; }
             }
 
             if (dragIdx >= 0)
@@ -1781,7 +2398,7 @@ namespace Battleship
                 if (e.type == EventType.MouseDown && e.button == 0)
                 {
                     if (over && CanPlace(dragIdx, cx, cy, orient))
-                    { fleet[dragIdx].placed = true; fleet[dragIdx].x = cx; fleet[dragIdx].y = cy; fleet[dragIdx].o = orient; message = AllPlaced() ? "Fleet ready — press ▶ Start!" : "Placed " + fleet[dragIdx].type + "."; dragIdx = -1; }
+                    { fleet[dragIdx].placed = true; fleet[dragIdx].x = cx; fleet[dragIdx].y = cy; fleet[dragIdx].o = orient; message = AllPlaced() ? T("Fleet ready — press ▶ Start!") : string.Format(T("Placed {0}."), T(fleet[dragIdx].type.ToString())); dragIdx = -1; }
                     else if (!over) { dragIdx = -1; message = "Returned to tray."; }
                     e.Use();
                 }
@@ -1811,16 +2428,16 @@ namespace Battleship
         {
             float bh = btn.fontSize + 16f;
             float y = boardY;
-            GUI.Label(new Rect(px, y, pw, big.fontSize + 8), "BATTLESHIP", big);
+            GUI.Label(new Rect(px, y, pw, big.fontSize + 8), lang == Lang.FR ? "BATAILLE NAVALE" : "BATTLESHIP", big);
             y += big.fontSize + 14;
 
-            string head = phase == Phase.Over ? (match.PlayerWon ? "YOU WIN!" : "AI WINS")
-                        : phase == Phase.Setup ? "PLACE YOUR FLEET"
-                        : showTarget ? "TARGETING" : "YOUR FLEET";
+            string head = phase == Phase.Over ? (match.PlayerWon ? T("YOU WIN!") : T("AI WINS"))
+                        : phase == Phase.Setup ? T("PLACE YOUR FLEET")
+                        : showTarget ? T("TARGETING") : T("YOUR FLEET");
             GUI.Label(new Rect(px, y, pw, hdr.fontSize + 6), head, hdr);
             y += hdr.fontSize + 10;
 
-            GUI.Label(new Rect(px, y, pw, (hdr.fontSize + 4) * 2), message, hdr);
+            GUI.Label(new Rect(px, y, pw, (hdr.fontSize + 4) * 2), T(message), hdr);
             y += (hdr.fontSize + 4) * 2 + 8;
 
             if (phase == Phase.Setup) { DrawSetupPanel(px, pw, y, e, mp); return; }
@@ -1828,17 +2445,17 @@ namespace Battleship
             if (phase == Phase.Playing)
             {
                 var r = new Rect(px, y, pw, bh * 1.3f);
-                if (!targeting) { GUI.enabled = match.PlayerTurn && !InputLocked; if (GUI.Button(r, "🎯 TARGET ▶", btn)) { targeting = true; Sfx(clipFlip, 0.8f); } GUI.enabled = true; }
-                else if (GUI.Button(r, "◀ MY FLEET", btn)) { targeting = false; Sfx(clipFlip, 0.8f); } // always available
+                if (!targeting) { GUI.enabled = match.PlayerTurn && !InputLocked; if (GUI.Button(r, T("🎯 TARGET ▶"), btn)) { targeting = true; Sfx(clipFlip, 0.8f); } GUI.enabled = true; }
+                else if (GUI.Button(r, T("◀ MY FLEET"), btn)) { targeting = false; Sfx(clipFlip, 0.8f); } // always available
                 y += bh * 1.3f + 14;
                 if (match.PlayerTurn && !match.Over && turnDeadline > 0f)
                 {
                     // your turn clock, mirrored from the radar LCD — with the same skip option
                     int tleft = Mathf.CeilToInt(Mathf.Max(0f, turnDeadline - Time.time));
-                    GUI.Label(new Rect(px, y, pw, hdr.fontSize + 6), "⏱ TURN TIMER: " + tleft + "s", hdr);
+                    GUI.Label(new Rect(px, y, pw, hdr.fontSize + 6), string.Format(T("⏱ TURN TIMER: {0}s"), tleft), hdr);
                     y += hdr.fontSize + 10;
                     GUI.enabled = !InputLocked;
-                    if (GUI.Button(new Rect(px, y, pw, bh * 1.3f), "⏭ END TURN", btn)) SkipTurn(false);
+                    if (GUI.Button(new Rect(px, y, pw, bh * 1.3f), T("⏭ END TURN"), btn)) SkipTurn(false);
                     GUI.enabled = true;
                     y += bh * 1.3f + 14;
                 }
@@ -1847,39 +2464,39 @@ namespace Battleship
                     // enemy turn is pending: confirm it, or let the countdown auto-end
                     bool canEnd = Time.time >= actionEndT;
                     GUI.enabled = canEnd;
-                    string lbl = canEnd ? "⏳ END TURN (" + Mathf.CeilToInt(Mathf.Max(0f, aiTimer)) + "s)" : "⏳ END TURN";
+                    string lbl = canEnd ? string.Format(T("⏳ END TURN ({0}s)"), Mathf.CeilToInt(Mathf.Max(0f, aiTimer))) : T("⏳ END TURN");
                     if (GUI.Button(new Rect(px, y, pw, bh * 1.3f), lbl, btn)) { aiTimer = 0.01f; Sfx(clipClick, 0.7f); }
                     GUI.enabled = true;
                     y += bh * 1.3f + 14;
                 }
-                GUI.Label(new Rect(px, y, pw, hdr.fontSize + 6), (showTarget ? "Enemy ships: " + match.EnemyBoard.ShipsRemaining : "Your ships: " + match.PlayerBoard.ShipsRemaining) + " / 5", hdr);
+                GUI.Label(new Rect(px, y, pw, hdr.fontSize + 6), showTarget ? string.Format(T("Enemy ships: {0} / 5"), match.EnemyBoard.ShipsRemaining) : string.Format(T("Your ships: {0} / 5"), match.PlayerBoard.ShipsRemaining), hdr);
                 y += hdr.fontSize + 14;
 
-                GUI.Label(new Rect(px, y, pw, hdr.fontSize + 4), "PERKS", hdr); y += hdr.fontSize + 8;
+                GUI.Label(new Rect(px, y, pw, hdr.fontSize + 4), T("PERKS"), hdr); y += hdr.fontSize + 8;
                 y = PerkButton(px, y, pw, ShipType.Destroyer,
-                    perkMode == PerkMode.Relocate ? "🚤 RELOCATE ◀ pick a spot" : "🚤 RELOCATE",
+                    T(perkMode == PerkMode.Relocate ? "🚤 RELOCATE ◀ pick a spot" : "🚤 RELOCATE"),
                     () => { perkMode = perkMode == PerkMode.Relocate ? PerkMode.None : PerkMode.Relocate; targeting = false; orient = fleet[FleetIndex(ShipType.Destroyer)].o; if (perkMode == PerkMode.Relocate) ComputeSailReach(); });
-                y = PerkButton(px, y, pw, ShipType.Carrier, "📡 RADAR SCOUT", DoRadar);
+                y = PerkButton(px, y, pw, ShipType.Carrier, T("📡 RADAR SCOUT"), DoRadar);
                 y = PerkButton(px, y, pw, ShipType.Battleship,
-                    match.ScorchArmed ? "☄ SCORCH ARMED ✓" : "☄ SCORCH",
+                    T(match.ScorchArmed ? "☄ SCORCH ARMED ✓" : "☄ SCORCH"),
                     () => match.ArmScorch(!match.ScorchArmed));
                 y = PerkButton(px, y, pw, ShipType.Cruiser,
-                    perkMode == PerkMode.Intercept ? "🛡 INTERCEPT ◀ pick a cell" : "🛡 INTERCEPT",
+                    T(perkMode == PerkMode.Intercept ? "🛡 INTERCEPT ◀ pick a cell" : "🛡 INTERCEPT"),
                     () => { perkMode = perkMode == PerkMode.Intercept ? PerkMode.None : PerkMode.Intercept; targeting = false; });
                 y = PerkButton(px, y, pw, ShipType.Submarine,
-                    perkMode == PerkMode.Torpedo ? "🐟 TORPEDO ◀ pick a lane" : "🐟 TORPEDO",
+                    T(perkMode == PerkMode.Torpedo ? "🐟 TORPEDO ◀ pick a lane" : "🐟 TORPEDO"),
                     () => { perkMode = perkMode == PerkMode.Torpedo ? PerkMode.None : PerkMode.Torpedo; targeting = perkMode == PerkMode.Torpedo; });
             }
             else
             {
-                if (GUI.Button(new Rect(px, y, pw, bh * 1.3f), "New Game", btn)) { Sfx(clipClick, 0.7f); NewGame(); }
+                if (GUI.Button(new Rect(px, y, pw, bh * 1.3f), T("New Game"), btn)) { Sfx(clipClick, 0.7f); NewGame(); }
             }
         }
 
         private void DrawSetupPanel(float px, float pw, float y, Event e, Vector2 mp)
         {
             float bh = btn.fontSize + 16f;
-            GUI.Label(new Rect(px, y, pw, hdr.fontSize + 4), "AI Difficulty", hdr); y += hdr.fontSize + 8;
+            GUI.Label(new Rect(px, y, pw, hdr.fontSize + 4), T("AI Difficulty"), hdr); y += hdr.fontSize + 8;
             float dw = (pw - 12f) / 3f;
             DiffRect(px, y, dw, bh, BattleshipAI.Level.Easy);
             DiffRect(px + dw + 6f, y, dw, bh, BattleshipAI.Level.Medium);
@@ -1887,16 +2504,16 @@ namespace Battleship
             y += bh + 14;
 
             float hw = (pw - 8f) / 2f;
-            if (GUI.Button(new Rect(px, y, hw, bh), "Rotate (R)", btn) && dragIdx >= 0) orient = Flip(orient);
-            if (GUI.Button(new Rect(px + hw + 8f, y, hw, bh), "Randomize", btn)) RandomizeFleet();
+            if (GUI.Button(new Rect(px, y, hw, bh), T("Rotate (R)"), btn) && dragIdx >= 0) orient = Flip(orient);
+            if (GUI.Button(new Rect(px + hw + 8f, y, hw, bh), T("Randomize"), btn)) RandomizeFleet();
             y += bh + 8;
-            if (GUI.Button(new Rect(px, y, hw, bh), "Clear", btn)) { for (int i = 0; i < fleet.Length; i++) fleet[i].placed = false; }
+            if (GUI.Button(new Rect(px, y, hw, bh), T("Clear"), btn)) { for (int i = 0; i < fleet.Length; i++) fleet[i].placed = false; }
             GUI.enabled = AllPlaced();
-            if (GUI.Button(new Rect(px + hw + 8f, y, hw, bh), "▶ Start", btn)) { Sfx(clipFlip, 0.8f); SyncBoard(); phase = Phase.Playing; targeting = false; message = "Your turn — tap TARGET to fire."; }
+            if (GUI.Button(new Rect(px + hw + 8f, y, hw, bh), T("▶ Start"), btn)) { Sfx(clipFlip, 0.8f); SyncBoard(); phase = Phase.Playing; targeting = false; message = "Your turn — tap TARGET to fire."; }
             GUI.enabled = true;
             y += bh + 16;
 
-            GUI.Label(new Rect(px, y, pw, hdr.fontSize + 4), "Drag ships to the board:", hdr); y += hdr.fontSize + 8;
+            GUI.Label(new Rect(px, y, pw, hdr.fontSize + 4), T("Drag ships to the board:"), hdr); y += hdr.fontSize + 8;
             DrawTrayVertical(px, y, pw, e, mp);
         }
 
@@ -1904,7 +2521,7 @@ namespace Battleship
         {
             var prev = GUI.backgroundColor;
             if (difficulty == d) GUI.backgroundColor = new Color(0.4f, 0.7f, 1f);
-            if (GUI.Button(new Rect(x, y, w, h), d.ToString(), btn) && difficulty != d) { difficulty = d; NewGame(); }
+            if (GUI.Button(new Rect(x, y, w, h), T(d.ToString()), btn) && difficulty != d) { difficulty = d; NewGame(); }
             GUI.backgroundColor = prev;
         }
 
@@ -1922,7 +2539,7 @@ namespace Battleship
                     var tex = shipTex != null ? shipTex[(int)fleet[i].type] : null;
                     if (tex != null) GUI.DrawTexture(new Rect(px, y, sw, sh), tex, ScaleMode.ScaleToFit);
                     else for (int k = 0; k < len; k++) Fill(new Rect(px + k * sh, y, sh - 2, sh - 2), ShipCol, "");
-                    GUI.Label(new Rect(px + pw * 0.62f, y, pw * 0.38f, sh), fleet[i].type + " (" + len + ")", small);
+                    GUI.Label(new Rect(px + pw * 0.62f, y, pw * 0.38f, sh), T(fleet[i].type.ToString()) + " (" + len + ")", small);
                 }
                 if (e.type == EventType.MouseDown && e.button == 0 && dragIdx < 0 && slot.Contains(mp)) { dragIdx = i; orient = Orientation.Horizontal; e.Use(); }
                 y += sh + 12;
@@ -2040,7 +2657,7 @@ namespace Battleship
             if (match.PlayerSetIntercept(cx, cy))
             {
                 perkMode = PerkMode.None;
-                message = "Counter-missile battery locked on " + Coord(cx, cy) + ".";
+                message = string.Format(T("Counter-missile battery locked on {0}."), Coord(cx, cy));
                 Sfx(clipPing, 0.7f); // battery lock-on
             }
             else message = "Can't protect that cell (already shot, or it's the cruiser's fire-control center).";
@@ -2415,14 +3032,14 @@ namespace Battleship
             lgTitle.fontSize = Mathf.Max(9, Mathf.RoundToInt(r.width * 0.055f));
             lgName.fontSize = Mathf.Max(8, Mathf.RoundToInt(r.width * 0.045f));
             lgDesc.fontSize = Mathf.Max(7, Mathf.RoundToInt(r.width * 0.036f));
-            GUI.Label(new Rect(r.x, r.y + r.height * 0.012f, r.width, r.height * 0.075f), "* LEGEND *", lgTitle);
+            GUI.Label(new Rect(r.x, r.y + r.height * 0.012f, r.width, r.height * 0.075f), T("* LEGEND *"), lgTitle);
 
             var entries = new (Texture2D tex, string name, string desc)[]
             {
-                (markHit, "HIT", "Ship hit"),
-                (markDestroyed, "DESTROYED", "Ship sunk"),
-                (markMiss, "MISS", "Nothing here"),
-                (markRecon, "RECON", "Enemy ship detected")
+                (markHit, T("HIT"), T("Ship hit")),
+                (markDestroyed, T("DESTROYED"), T("Ship sunk")),
+                (markMiss, T("MISS"), T("Nothing here")),
+                (markRecon, T("RECON"), T("Enemy ship detected"))
             };
             float top = r.y + r.height * 0.105f;
             float entryH = (r.height * 0.87f) / entries.Length; // equal share for every entry
@@ -2482,9 +3099,9 @@ namespace Battleship
 
             var rows = new (string label, string val)[]
             {
-                ("SHOTS FIRED", shots.ToString()),
-                ("HITS", hits.ToString()),
-                ("SHIPS SUNK", sunk + "/5")
+                (T("SHOTS FIRED"), shots.ToString()),
+                (T("HITS"), hits.ToString()),
+                (T("SHIPS SUNK"), sunk + "/5")
             };
             lgName.fontSize = Mathf.Max(8, Mathf.RoundToInt(r.width * 0.04f));
             stVal.fontSize = Mathf.Max(9, Mathf.RoundToInt(r.width * 0.048f));
@@ -2518,11 +3135,11 @@ namespace Battleship
 
             var cards = new (ShipType t, string name, string desc, Color col)[]
             {
-                (ShipType.Carrier,    "SCOUT",     "LAUNCH A PLANE SCOUT.",   new Color(0.55f, 0.85f, 0.40f)),
-                (ShipType.Cruiser,    "INTERCEPT", "INTERCEPT ENEMY MISSILE.", new Color(0.40f, 0.66f, 1.00f)),
-                (ShipType.Battleship, "SCORCH",    "MULTIPLE FIRING MISSILE.", new Color(1.00f, 0.62f, 0.18f)),
-                (ShipType.Submarine,  "TORPEDO",   "LAUNCH A TORPEDO.",        new Color(0.25f, 0.85f, 0.80f)),
-                (ShipType.Destroyer,  "RELOCATE",  "MOVE A SHIP TO A NEW POSITION.", new Color(0.74f, 0.52f, 1.00f)),
+                (ShipType.Carrier,    T("SCOUT"),     T("LAUNCH A PLANE SCOUT."),   new Color(0.55f, 0.85f, 0.40f)),
+                (ShipType.Cruiser,    T("INTERCEPT"), T("INTERCEPT ENEMY MISSILE."), new Color(0.40f, 0.66f, 1.00f)),
+                (ShipType.Battleship, T("SCORCH"),    T("MULTIPLE FIRING MISSILE."), new Color(1.00f, 0.62f, 0.18f)),
+                (ShipType.Submarine,  T("TORPEDO"),   T("LAUNCH A TORPEDO."),        new Color(0.25f, 0.85f, 0.80f)),
+                (ShipType.Destroyer,  T("RELOCATE"),  T("MOVE A SHIP TO A NEW POSITION."), new Color(0.74f, 0.52f, 1.00f)),
             };
 
             for (int i = 0; i < cards.Length; i++)
@@ -2537,10 +3154,10 @@ namespace Battleship
                              (t == ShipType.Battleship && match.ScorchArmed);
                 bool ready = !disabled && cd <= 0 && playing && match.PlayerTurn && !InputLocked;
                 string blurb = !armed ? desc :
-                    t == ShipType.Cruiser ? "PICK A CELL TO SHIELD." :
-                    t == ShipType.Submarine ? "PICK A LANE." :
-                    t == ShipType.Destroyer ? "PICK A SPOT." : "ARMED — NEXT SALVO x2.";
-                string stat = disabled ? "OFFLINE" : cd > 0 ? "CD " + cd : armed ? "ARMED" : "READY";
+                    t == ShipType.Cruiser ? T("PICK A CELL TO SHIELD.") :
+                    t == ShipType.Submarine ? T("PICK A LANE.") :
+                    t == ShipType.Destroyer ? T("PICK A SPOT.") : T("ARMED — NEXT SALVO x2.");
+                string stat = disabled ? T("OFFLINE") : cd > 0 ? "CD " + cd : armed ? T("ARMED") : T("READY");
 
                 if (Event.current.type == EventType.Repaint)
                 {
@@ -2755,7 +3372,7 @@ namespace Battleship
             if (radarTitle != null)
             {
                 radarTitle.fontSize = Mathf.Max(7, Mathf.RoundToInt(tab.height * 0.62f));
-                GUI.Label(tab, "TURN-END", radarTitle);
+                GUI.Label(tab, T("TURN-END"), radarTitle);
             }
         }
 
@@ -2799,7 +3416,7 @@ namespace Battleship
                 }
                 fleetBtnLbl.normal.textColor = ink;
                 fleetBtnLbl.fontSize = Mathf.Max(8, Mathf.RoundToInt(r.height * 0.20f));
-                GUI.Label(r, "END TURN", fleetBtnLbl);
+                GUI.Label(r, T("END TURN"), fleetBtnLbl);
 
                 if (!avail) // plate goes dark until there is a turn to end
                     GUI.DrawTexture(r, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f,
@@ -2826,8 +3443,9 @@ namespace Battleship
                 msgStyle = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, wordWrap = true };
                 if (uiFont != null) msgStyle.font = uiFont;
             }
-            var sb = new System.Text.StringBuilder(message.Length);
-            foreach (char ch in message)
+            string src = T(message);
+            var sb = new System.Text.StringBuilder(src.Length);
+            foreach (char ch in src)
             {
                 if (ch == '—' || ch == '–') sb.Append('-');       // em/en dash → hyphen
                 else if (ch == '…') sb.Append("...");                  // ellipsis
@@ -2900,7 +3518,7 @@ namespace Battleship
             if (radarTitle != null)
             {
                 radarTitle.fontSize = Mathf.Max(8, Mathf.RoundToInt(s.height * 0.17f));
-                GUI.Label(new Rect(s.x, s.y + s.height * 0.12f, s.width, s.height * 0.32f), "STATUS", radarTitle);
+                GUI.Label(new Rect(s.x, s.y + s.height * 0.12f, s.width, s.height * 0.32f), T("STATUS"), radarTitle);
             }
 
             float lw = s.width * 0.125f, lh = s.height * 0.26f, gap = lw * 0.28f;

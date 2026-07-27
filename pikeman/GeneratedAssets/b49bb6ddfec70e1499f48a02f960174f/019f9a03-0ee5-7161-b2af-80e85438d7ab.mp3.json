@@ -1,0 +1,15 @@
+{
+    "asset": "b49bb6ddfec70e1499f48a02f960174f",
+    "fileName": "019f9a03-0ee5-7161-b2af-80e85438d7ab.mp3",
+    "prompt": "Cinematic naval strategy game main-menu theme. Calm, brooding tension — the quiet before battle. Deep ocean ambience and low sub-bass swells, slow sustained strings and distant brass pad, sparse sonar-ping blips in rhythm, a subtle muffled military snare pulse, minimal 4-note motif. Atmospheric, seamless loop friendly, no vocals, moderate slow tempo around 70 BPM, minor key.",
+    "negativePrompt": "",
+    "model": "google-lyria-3-clip",
+    "modelName": "Google Lyria 3 Clip",
+    "customSeed": -1,
+    "w3CTraceId": "",
+    "feedback": 0,
+    "duration": 30.0,
+    "autoTrim": false,
+    "hasReference": false,
+    "voice": ""
+}
