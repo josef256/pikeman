@@ -32,7 +32,13 @@ namespace Battleship
         public bool IsHost { get; private set; }
         public bool Busy { get; private set; }                // an async op is in flight (host/join)
 
+        // Step 3 — Relay transport status (the byte channel that sits on top of the lobby session)
+        public bool RelayLinked => transport != null && transport.Connected;   // UTP peer link is up
+        public bool PingOk { get; private set; }               // a Ping/Pong round-trip has completed
+        public string TransportInfo => transport != null ? transport.Diag() : "no transport";  // on-screen debug
+
         private ISession session;
+        private PikeTransport transport;
 
         public bool InSession => session != null;
 
@@ -42,11 +48,14 @@ namespace Battleship
         public async void Host()
         {
             if (Busy) return;
-            Busy = true; Error = ""; IsHost = true; PlayerCount = 0; State = Status.Connecting;
+            Busy = true; Error = ""; IsHost = true; PlayerCount = 0; PingOk = false; State = Status.Connecting;
             try
             {
                 await EnsureSignedIn();
-                var options = new SessionOptions { MaxPlayers = 2 };   // lobby-only for now (Relay comes in Step 3)
+                transport = NewTransport();
+                var options = new SessionOptions { MaxPlayers = 2 }
+                    .WithRelayNetwork()                 // allocate a Relay endpoint for this room
+                    .WithNetworkHandler(transport);     // drive it with our raw UTP handler
                 IHostSession host = await MultiplayerService.Instance.CreateSessionAsync(options);
                 Bind(host);
                 JoinCode = host.Code;
@@ -63,11 +72,14 @@ namespace Battleship
             if (Busy) return;
             string clean = Sanitize(code);   // strip spaces/punctuation, force uppercase — UGS rejects anything else
             if (clean.Length == 0) { Error = "Enter a room code first."; State = Status.Error; return; }
-            Busy = true; Error = ""; IsHost = false; PlayerCount = 0; State = Status.Connecting;
+            Busy = true; Error = ""; IsHost = false; PlayerCount = 0; PingOk = false; State = Status.Connecting;
             try
             {
                 await EnsureSignedIn();
-                ISession s = await MultiplayerService.Instance.JoinSessionByCodeAsync(clean);
+                transport = NewTransport();
+                // the guest inherits the Relay network from the session; it only attaches the handler
+                var jopt = new JoinSessionOptions().WithNetworkHandler(transport);
+                ISession s = await MultiplayerService.Instance.JoinSessionByCodeAsync(clean, jopt);
                 Bind(s);
                 JoinCode = s.Code;
                 RefreshCount();
@@ -81,10 +93,48 @@ namespace Battleship
         public async void Leave()
         {
             var s = session;
-            session = null;
-            State = Status.Offline; JoinCode = ""; PlayerCount = 0; Error = ""; IsHost = false;
+            session = null; transport = null;   // the SDK calls transport.StopAsync as the session network tears down
+            State = Status.Offline; JoinCode = ""; PlayerCount = 0; Error = ""; IsHost = false; PingOk = false;
             if (s != null) { try { await s.LeaveAsync(); } catch { /* best-effort on the way out */ } }
         }
+
+        /// <summary>Pump the Relay transport. Called every frame from BattleshipController.Update.</summary>
+        public void Tick() => transport?.Tick();
+
+        // ---- Relay transport wiring (Step 3) ----
+
+        private PikeTransport NewTransport()
+        {
+            var t = new PikeTransport();
+            t.OnConnected    += OnRelayConnected;
+            t.OnData         += OnRelayData;
+            t.OnDisconnected += OnRelayDisconnected;
+            return t;
+        }
+
+        private void OnRelayConnected()
+        {
+            // the host opens the round-trip probe as soon as the byte channel is live
+            if (IsHost) transport?.Send(new byte[] { (byte)NetMsg.Ping });
+        }
+
+        private void OnRelayData(byte[] data)
+        {
+            if (data == null || data.Length == 0) return;
+            switch ((NetMsg)data[0])
+            {
+                case NetMsg.Ping:
+                    transport?.Send(new byte[] { (byte)NetMsg.Pong });   // guest bounces it back
+                    PingOk = true;
+                    break;
+                case NetMsg.Pong:
+                    PingOk = true;                                        // host saw the reply -> link proven
+                    Debug.Log("[PikeNet] Relay round-trip OK");
+                    break;
+            }
+        }
+
+        private void OnRelayDisconnected() { PingOk = false; }
 
         /// <summary>Keep only A–Z / 0–9 (uppercased) — the exact character set UGS join codes use.
         /// Used both to filter the JOIN text field live and to clean the code before joining, so a
@@ -128,8 +178,8 @@ namespace Battleship
 
         private void OnRemoved()
         {
-            session = null;
-            State = Status.Offline; PlayerCount = 0; JoinCode = ""; IsHost = false;
+            session = null; transport = null;
+            State = Status.Offline; PlayerCount = 0; JoinCode = ""; IsHost = false; PingOk = false;
         }
 
         private void Fail(Exception ex)

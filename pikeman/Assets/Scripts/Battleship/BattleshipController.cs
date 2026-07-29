@@ -578,6 +578,7 @@ namespace Battleship
         private void Update()
         {
             Cursor.visible = false; // the game draws its own cursor (end of OnGUI)
+            net?.Tick();            // pump the Relay transport every frame (no-op when not connected)
             if (pendingMsg != null && Time.time >= pendingMsgAt) { message = pendingMsg; pendingMsg = null; }
             for (int i = pendingSfx.Count - 1; i >= 0; i--)
                 if (Time.time >= pendingSfx[i].t) { Sfx(pendingSfx[i].c, pendingSfx[i].vol); pendingSfx.RemoveAt(i); }
@@ -1151,8 +1152,13 @@ namespace Battleship
                     string.Format(T("{0} PLAYERS IN ROOM"), net.PlayerCount), new Color(0.82f, 0.90f, 0.97f), 0.34f);
                 DrawNetLabel(new Rect(innerX, y + bh * 1.7f, innerW, bh),
                     T("ROOM CODE") + "  " + net.JoinCode, new Color(0.62f, 1f, 0.72f), 0.34f);
-                DrawNetLabel(new Rect(innerX, y + bh * 2.6f, innerW, bh),
-                    T("Ready - match sync arrives next step."), new Color(0.45f, 0.72f, 0.88f), 0.28f);
+                string relay = net.PingOk ? T("RELAY LINKED - PING OK")
+                             : net.RelayLinked ? T("RELAY LINKED")
+                             : T("RELAY LINKING...");
+                DrawNetLabel(new Rect(innerX, y + bh * 2.6f, innerW, bh), relay,
+                    net.PingOk ? new Color(0.55f, 1f, 0.68f) : new Color(0.45f, 0.72f, 0.88f), 0.28f);
+                DrawNetLabel(new Rect(innerX, y + bh * 3.25f, innerW, bh * 0.7f), net.TransportInfo,
+                    new Color(0.55f, 0.66f, 0.78f), 0.24f);   // debug: raw transport phase
 
                 if (NetButton(new Rect(px + (pw - innerW * 0.6f) * 0.5f, py + ph - bh - ph * 0.09f, innerW * 0.6f, bh),
                               T("LEAVE ROOM"), e, true))
@@ -1507,6 +1513,8 @@ namespace Battleship
             { "SHARE THIS CODE", "PARTAGEZ CE CODE" }, { "Waiting for opponent...", "En attente d'un adversaire..." },
             { "- OR JOIN BY CODE -", "- OU REJOINDRE PAR CODE -" }, { "JOIN", "REJOINDRE" },
             { "Connecting...", "Connexion..." }, { "Error: ", "Erreur : " },
+            { "RELAY LINKED - PING OK", "RELAIS CONNECTE - PING OK" }, { "RELAY LINKED", "RELAIS CONNECTE" },
+            { "RELAY LINKING...", "CONNEXION RELAIS..." },
             // setup panel (legacy text panel — kept for reference)
             { "AI Difficulty", "Difficulte IA" }, { "Rotate (R)", "Pivoter (R)" }, { "Randomize", "Aleatoire" },
             { "Clear", "Effacer" }, { "▶ Start", "▶ Demarrer" }, { "Drag ships to the board:", "Glissez les navires sur la grille :" },
