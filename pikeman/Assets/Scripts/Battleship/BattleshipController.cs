@@ -26,6 +26,9 @@ namespace Battleship
         private float menuNoteUntil = -1f;
         private bool settingsOpen = false;  // settings panel overlaid on the home menu
         private int activeSlider = -1;      // which settings slider is being dragged (0=music, 1=sfx, -1=none)
+        private bool netOpen = false;       // multiplayer connect overlay (Step 2)
+        private PikeNet net;                // UGS connection layer (sign-in + 2-player session)
+        private string netCodeEntry = "";   // room code the guest is typing in the JOIN field
         private Lang lang = Lang.EN;        // UI language; persisted in PlayerPrefs, switched from Settings
         private int dragIdx = -1;
         private Orientation orient = Orientation.Horizontal;
@@ -226,6 +229,7 @@ namespace Battleship
             sfxVolume = Mathf.Clamp01(PlayerPrefs.GetFloat("pk_sfxVol", sfxVolume));
             musicVolume = Mathf.Clamp01(PlayerPrefs.GetFloat("pk_musicVol", musicVolume));
             lang = (Lang)Mathf.Clamp(PlayerPrefs.GetInt("pk_lang", 0), 0, 1);
+            net = new PikeNet();
             NewGame();
             phase = Phase.Menu; // first screen on launch is the home menu, not fleet setup
         }
@@ -1036,6 +1040,7 @@ namespace Battleship
 
             // settings overlay takes over input while open — the menu buttons underneath stay inert
             if (settingsOpen) { DrawSettings(e); return; }
+            if (netOpen) { DrawNetOverlay(e); return; }
 
             // the four button plates, measured off the art as fractions of the frame.
             // xL/xR = plate span, top of the first plate, and the top-to-top step down the stack.
@@ -1043,7 +1048,7 @@ namespace Battleship
             var items = new (string label, System.Action act)[]
             {
                 ("PLAY",        () => { Sfx(clipFlip, 0.9f); NewGame(); }),                 // fresh boards → Setup
-                ("MULTIPLAYER", () => MenuNote("MULTIPLAYER — COMING SOON")),
+                ("MULTIPLAYER", () => { Sfx(clipClick, 0.7f); netOpen = true; }),
                 ("SETTINGS",    () => { Sfx(clipClick, 0.7f); settingsOpen = true; activeSlider = -1; }),
                 ("QUIT",        () => { Sfx(clipClick, 0.7f); QuitGame(); }),
             };
@@ -1091,6 +1096,174 @@ namespace Battleship
         }
 
         private void MenuNote(string m) { Sfx(clipClick, 0.7f); menuNote = m; menuNoteUntil = Time.time + 2.2f; }
+
+        // MULTIPLAYER connect overlay (Step 2) — HOST a room (get a share code) or JOIN by code.
+        // Lobby-only for now: "CONNECTED" means both players are in the same session. Actual move
+        // sync over Relay is Step 3. Overlaid on the dimmed home menu, same look as DrawSettings.
+        private void DrawNetOverlay(Event e)
+        {
+            float W = Screen.width, H = Screen.height;
+
+            if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape) { CloseNet(); e.Use(); return; }
+
+            // dim the menu art behind the panel
+            if (e.type == EventType.Repaint)
+            {
+                Color pc = GUI.color;
+                GUI.color = new Color(0.02f, 0.05f, 0.09f, 0.72f);
+                GUI.DrawTexture(new Rect(0, 0, W, H), Texture2D.whiteTexture);
+                GUI.color = pc;
+            }
+
+            float pw = Mathf.Min(W * 0.62f, 760f);
+            float ph = Mathf.Min(H * 0.66f, 560f);
+            float px = (W - pw) * 0.5f, py = (H - ph) * 0.5f;
+            var panel = new Rect(px, py, pw, ph);
+
+            if (e.type == EventType.Repaint)
+            {
+                Color pc = GUI.color;
+                GUI.color = new Color(0.05f, 0.11f, 0.17f, 0.97f);
+                GUI.DrawTexture(panel, Texture2D.whiteTexture);
+                GUI.color = new Color(0.30f, 0.85f, 0.45f, 0.55f);
+                DrawFrame(panel, Mathf.Max(2f, H * 0.003f));
+                GUI.color = pc;
+
+                var ts = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter };
+                ts.fontSize = Mathf.RoundToInt(Mathf.Clamp(H * 0.036f, 14f, 28f));
+                ts.normal.textColor = new Color(0.72f, 1f, 0.82f);
+                GUI.Label(new Rect(px, py + ph * 0.05f, pw, ph * 0.14f), T("MULTIPLAYER"), ts);
+            }
+
+            float pad = pw * 0.09f;
+            float innerX = px + pad, innerW = pw - pad * 2f;
+            float y = py + ph * 0.24f;
+            float bh = ph * 0.14f;
+
+            bool connected = net.State == PikeNet.Status.Connected;
+            bool busy = net.Busy || net.State == PikeNet.Status.Connecting;
+
+            if (connected)
+            {
+                // success state — both players are in the room
+                DrawNetLabel(new Rect(innerX, y, innerW, bh), T("CONNECTED"), new Color(0.55f, 1f, 0.68f), 0.5f);
+                DrawNetLabel(new Rect(innerX, y + bh * 0.9f, innerW, bh),
+                    string.Format(T("{0} PLAYERS IN ROOM"), net.PlayerCount), new Color(0.82f, 0.90f, 0.97f), 0.34f);
+                DrawNetLabel(new Rect(innerX, y + bh * 1.7f, innerW, bh),
+                    T("ROOM CODE") + "  " + net.JoinCode, new Color(0.62f, 1f, 0.72f), 0.34f);
+                DrawNetLabel(new Rect(innerX, y + bh * 2.6f, innerW, bh),
+                    T("Ready - match sync arrives next step."), new Color(0.45f, 0.72f, 0.88f), 0.28f);
+
+                if (NetButton(new Rect(px + (pw - innerW * 0.6f) * 0.5f, py + ph - bh - ph * 0.09f, innerW * 0.6f, bh),
+                              T("LEAVE ROOM"), e, true))
+                { Sfx(clipClick, 0.7f); net.Leave(); }
+            }
+            else
+            {
+                // HOST
+                if (NetButton(new Rect(innerX, y, innerW, bh), net.IsHost && net.State == PikeNet.Status.Hosting
+                        ? T("HOSTING...") : T("HOST A ROOM"), e, !busy))
+                { Sfx(clipFlip, 0.8f); net.Host(); }
+
+                // host's share code + waiting line
+                if (net.IsHost && !string.IsNullOrEmpty(net.JoinCode))
+                {
+                    DrawNetLabel(new Rect(innerX, y + bh * 1.02f, innerW, bh * 0.8f),
+                        T("SHARE THIS CODE") + "  " + net.JoinCode, new Color(0.62f, 1f, 0.72f), 0.34f);
+                    DrawNetLabel(new Rect(innerX, y + bh * 1.72f, innerW, bh * 0.7f),
+                        T("Waiting for opponent..."), new Color(0.45f, 0.72f, 0.88f), 0.28f);
+                }
+
+                // JOIN — code field + button
+                float jy = y + bh * 2.7f;
+                DrawNetLabel(new Rect(innerX, jy - bh * 0.55f, innerW, bh * 0.55f), T("- OR JOIN BY CODE -"),
+                    new Color(0.55f, 0.66f, 0.78f), 0.26f);
+                float fieldW = innerW * 0.58f, joinW = innerW * 0.38f, gap = innerW * 0.04f;
+                var fieldR = new Rect(innerX, jy, fieldW, bh);
+                if (e.type == EventType.Repaint)
+                {
+                    Color pc = GUI.color;
+                    GUI.color = new Color(0.10f, 0.18f, 0.26f, 0.95f);
+                    GUI.DrawTexture(fieldR, Texture2D.whiteTexture);
+                    GUI.color = new Color(0.30f, 0.85f, 0.45f, 0.40f);
+                    DrawFrame(fieldR, 1.5f);
+                    GUI.color = pc;
+                }
+                var tf = new GUIStyle(GUI.skin.textField) { alignment = TextAnchor.MiddleCenter };
+                if (hdr.font != null) tf.font = hdr.font;
+                tf.fontSize = Mathf.RoundToInt(Mathf.Clamp(bh * 0.36f, 12f, 22f));
+                tf.normal.textColor = tf.focused.textColor = new Color(0.82f, 0.95f, 0.88f);
+                GUI.SetNextControlName("netCode");
+                netCodeEntry = GUI.TextField(new Rect(fieldR.x + 6f, fieldR.y, fieldR.width - 12f, fieldR.height),
+                                             netCodeEntry ?? "", 8, tf);
+                netCodeEntry = PikeNet.Sanitize(netCodeEntry);   // only A-Z/0-9 make it into the field
+
+                if (NetButton(new Rect(innerX + fieldW + gap, jy, joinW, bh), T("JOIN"), e,
+                              !busy && !string.IsNullOrWhiteSpace(netCodeEntry)))
+                { Sfx(clipFlip, 0.8f); net.Join(netCodeEntry); }
+
+                // status / error line
+                string status = net.State == PikeNet.Status.Connecting ? T("Connecting...")
+                              : net.State == PikeNet.Status.Error ? (T("Error: ") + net.Error)
+                              : "";
+                if (e.type == EventType.Repaint && !string.IsNullOrEmpty(status))
+                {
+                    var ss = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter, wordWrap = true };
+                    ss.fontSize = Mathf.RoundToInt(Mathf.Clamp(bh * 0.26f, 9f, 16f));
+                    ss.normal.textColor = net.State == PikeNet.Status.Error
+                        ? new Color(1f, 0.55f, 0.5f) : new Color(0.45f, 0.72f, 0.88f);
+                    GUI.Label(new Rect(innerX, jy + bh * 1.15f, innerW, bh * 1.1f), status, ss);
+                }
+
+                // BACK
+                if (NetButton(new Rect(px + (pw - innerW * 0.5f) * 0.5f, py + ph - bh - ph * 0.05f, innerW * 0.5f, bh),
+                              T("◀ BACK"), e, true))
+                { CloseNet(); }
+            }
+
+            // software cursor (this method returns before DrawHomeMenu's own cursor pass)
+            if (e.type == EventType.Repaint && cursorTex != null)
+            {
+                float chS = Mathf.Max(18f, H * 0.03f);
+                float cwS = chS * cursorTex.width / cursorTex.height;
+                GUI.DrawTexture(new Rect(e.mousePosition.x, e.mousePosition.y, cwS, chS), cursorTex, ScaleMode.StretchToFill);
+            }
+        }
+
+        private void CloseNet() { Sfx(clipClick, 0.7f); if (net.InSession) net.Leave(); netOpen = false; }
+
+        // a centred pixel-font label inside a rect; sizeFrac scales the font off the rect height
+        private void DrawNetLabel(Rect r, string text, Color col, float sizeFrac)
+        {
+            if (Event.current.type != EventType.Repaint) return;
+            var s = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter, wordWrap = true };
+            s.fontSize = Mathf.RoundToInt(Mathf.Clamp(r.height * sizeFrac, 9f, 30f));
+            s.normal.textColor = col;
+            GUI.Label(r, text, s);
+        }
+
+        // a framed plate button matching the settings BACK button; returns true on click
+        private bool NetButton(Rect r, string label, Event e, bool enabled)
+        {
+            bool hot = enabled && r.Contains(e.mousePosition);
+            if (e.type == EventType.Repaint)
+            {
+                Color pc = GUI.color;
+                GUI.color = !enabled ? new Color(0.14f, 0.20f, 0.26f, 0.30f)
+                          : hot ? new Color(0.30f, 0.85f, 0.45f, 0.22f) : new Color(0.20f, 0.30f, 0.40f, 0.30f);
+                GUI.DrawTexture(r, Texture2D.whiteTexture);
+                GUI.color = new Color(0.30f, 0.85f, 0.45f, enabled ? (hot ? 0.75f : 0.40f) : 0.20f);
+                DrawFrame(r, 2f);
+                GUI.color = pc;
+                var bs = new GUIStyle(hdr) { alignment = TextAnchor.MiddleCenter };
+                bs.fontSize = Mathf.RoundToInt(Mathf.Clamp(r.height * 0.32f, 11f, 22f));
+                bs.normal.textColor = !enabled ? new Color(0.5f, 0.58f, 0.66f, 0.6f)
+                    : hot ? new Color(0.62f, 1f, 0.72f) : new Color(0.82f, 0.90f, 0.97f);
+                GUI.Label(r, label, bs);
+            }
+            if (!enabled) return false;
+            return GUI.Button(r, GUIContent.none, GUIStyle.none);
+        }
 
         // Fleet-placement screen — the FleetPlacement.png art (board frame, empty ship dock, empty
         // chip/button plates) is the backdrop; the live 10×10 grid, ship dock, difficulty chips and
@@ -1327,6 +1500,13 @@ namespace Battleship
             // fleet-placement screen (framed setup) — short labels sized to the baked plates
             { "RANDOM", "ALEATOIRE" }, { "CLEAR", "EFFACER" }, { "START", "DEMARRER" },
             { "Right-click to rotate", "Clic droit pour pivoter" },
+            // multiplayer connect overlay (Step 2) — ASCII-only French (pixel font, no accents)
+            { "CONNECTED", "CONNECTE" }, { "{0} PLAYERS IN ROOM", "{0} JOUEURS DANS LE SALON" },
+            { "ROOM CODE", "CODE DU SALON" }, { "Ready - match sync arrives next step.", "Pret - la synchro arrive a la prochaine etape." },
+            { "LEAVE ROOM", "QUITTER LE SALON" }, { "HOST A ROOM", "CREER UN SALON" }, { "HOSTING...", "HEBERGEMENT..." },
+            { "SHARE THIS CODE", "PARTAGEZ CE CODE" }, { "Waiting for opponent...", "En attente d'un adversaire..." },
+            { "- OR JOIN BY CODE -", "- OU REJOINDRE PAR CODE -" }, { "JOIN", "REJOINDRE" },
+            { "Connecting...", "Connexion..." }, { "Error: ", "Erreur : " },
             // setup panel (legacy text panel — kept for reference)
             { "AI Difficulty", "Difficulte IA" }, { "Rotate (R)", "Pivoter (R)" }, { "Randomize", "Aleatoire" },
             { "Clear", "Effacer" }, { "▶ Start", "▶ Demarrer" }, { "Drag ships to the board:", "Glissez les navires sur la grille :" },
