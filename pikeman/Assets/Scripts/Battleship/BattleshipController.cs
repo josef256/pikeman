@@ -29,6 +29,8 @@ namespace Battleship
         private bool netOpen = false;       // multiplayer connect overlay (Step 2)
         private PikeNet net;                // UGS connection layer (sign-in + 2-player session)
         private string netCodeEntry = "";   // room code the guest is typing in the JOIN field
+        private bool online = false;        // true while in a networked 1v1 (disables the AI)
+        private bool onlineWaiting = false; // pressed READY, waiting for the opponent's fleet
         private Lang lang = Lang.EN;        // UI language; persisted in PlayerPrefs, switched from Settings
         private int dragIdx = -1;
         private Orientation orient = Orientation.Horizontal;
@@ -230,6 +232,7 @@ namespace Battleship
             musicVolume = Mathf.Clamp01(PlayerPrefs.GetFloat("pk_musicVol", musicVolume));
             lang = (Lang)Mathf.Clamp(PlayerPrefs.GetInt("pk_lang", 0), 0, 1);
             net = new PikeNet();
+            net.OnMatchStart += BeginOnlineMatch;   // both fleets ready -> drop into Playing in sync
             NewGame();
             phase = Phase.Menu; // first screen on launch is the home menu, not fleet setup
         }
@@ -246,6 +249,7 @@ namespace Battleship
         {
             match = new BattleshipMatch();
             match.SetupEnemy(difficulty, seed);
+            online = false; onlineWaiting = false;   // single-player by default; StartOnlineSetup re-arms online
             fleet = new FleetShip[Ships.Standard.Length];
             for (int i = 0; i < fleet.Length; i++) fleet[i] = new FleetShip { type = Ships.Standard[i], placed = false };
             dragIdx = -1; orient = Orientation.Horizontal; targeting = false;
@@ -618,7 +622,7 @@ namespace Battleship
                 pendReveal = -1f;
             }
             // TURN CLOCK: your turn is on a timer — let it run out and the turn is forfeited
-            if (phase == Phase.Playing && !match.Over)
+            if (phase == Phase.Playing && !match.Over && !online)
             {
                 if (match.PlayerTurn && (!prevPlayerTurn || turnDeadline < 0f))
                     turnDeadline = Mathf.Max(Time.time, lockUntil) + turnTime; // clock starts once the enemy visuals clear
@@ -626,6 +630,7 @@ namespace Battleship
                     SkipTurn(true);
                 prevPlayerTurn = match.PlayerTurn;
             }
+            if (online) return;   // online: no local AI — the opponent's moves arrive over the network (Step 6)
             if (match.PlayerTurn || match.Over) return;
             aiTimer -= Time.deltaTime;
             if (aiTimer <= 0f)
@@ -1160,7 +1165,12 @@ namespace Battleship
                 DrawNetLabel(new Rect(innerX, y + bh * 3.25f, innerW, bh * 0.7f), net.TransportInfo,
                     new Color(0.55f, 0.66f, 0.78f), 0.24f);   // debug: raw transport phase
 
-                if (NetButton(new Rect(px + (pw - innerW * 0.6f) * 0.5f, py + ph - bh - ph * 0.09f, innerW * 0.6f, bh),
+                // proceed to fleet placement once the byte channel is up (both players do this)
+                if (NetButton(new Rect(innerX, py + ph - bh * 2.35f - ph * 0.06f, innerW, bh),
+                              T("PLACE FLEET"), e, net.RelayLinked))
+                { StartOnlineSetup(); }
+
+                if (NetButton(new Rect(px + (pw - innerW * 0.6f) * 0.5f, py + ph - bh - ph * 0.06f, innerW * 0.6f, bh),
                               T("LEAVE ROOM"), e, true))
                 { Sfx(clipClick, 0.7f); net.Leave(); }
             }
@@ -1237,6 +1247,37 @@ namespace Battleship
         }
 
         private void CloseNet() { Sfx(clipClick, 0.7f); if (net.InSession) net.Leave(); netOpen = false; }
+
+        // From the connect overlay: leave the menu and go place a fleet for a networked match.
+        private void StartOnlineSetup()
+        {
+            Sfx(clipFlip, 0.8f);
+            netOpen = false;
+            NewGame();               // fresh boards + empty fleet slots (also clears the online flag)...
+            online = true;           // ...then mark THIS as a networked match
+            phase = Phase.Setup;
+            message = "Place your fleet, then READY.";
+        }
+
+        // Fired by PikeNet once both players are READY. myTurn = does this client shoot first.
+        private void BeginOnlineMatch(bool myTurn)
+        {
+            match.SetOnlineStart(myTurn);
+            onlineWaiting = false;
+            phase = Phase.Playing;
+            targeting = false;
+            prevPlayerTurn = !myTurn;   // force the turn indicator to refresh
+            message = myTurn ? "YOUR TURN" : "OPPONENT'S TURN";
+        }
+
+        // Temporary guard: in an online match, the move seams (fire/torpedo/perks) aren't wired to the
+        // network yet — that's Steps 6-7. Block them locally so they can't desync the two games.
+        private bool OnlineActionBlocked()
+        {
+            if (!online) return false;
+            message = "Online moves arrive in the next step.";
+            return true;
+        }
 
         // a centred pixel-font label inside a rect; sizeFrac scales the font off the rect height
         private void DrawNetLabel(Rect r, string text, Color col, float sizeFrac)
@@ -1344,7 +1385,7 @@ namespace Battleship
             for (int i = 0; i < 3; i++) { diffR[i] = NRect(col[i], diffY, colW[i], rowH, art); ctrlR[i] = NRect(col[i], ctrlY, colW[i], rowH, art); }
 
             string[] diffLbl = { T("Easy").ToUpperInvariant(), T("Medium").ToUpperInvariant(), T("Hard").ToUpperInvariant() };
-            string[] ctrlLbl = { T("RANDOM"), T("CLEAR"), T("START") };
+            string[] ctrlLbl = { T("RANDOM"), T("CLEAR"), online ? T("READY") : T("START") };
             int rowFont = SharedFont(new[] { diffR[0], diffR[1], diffR[2], ctrlR[0], ctrlR[1], ctrlR[2] },
                                      new[] { diffLbl[0], diffLbl[1], diffLbl[2], ctrlLbl[0], ctrlLbl[1], ctrlLbl[2] },
                                      Mathf.RoundToInt(diffR[0].height * 0.42f), 7);
@@ -1360,8 +1401,15 @@ namespace Battleship
             }
             SetupButton(ctrlR[0], ctrlLbl[0], rowFont, true, false, ctrlOff[0], e, mp, () => { RandomizeFleet(); Sfx(clipClick, 0.7f); });
             SetupButton(ctrlR[1], ctrlLbl[1], rowFont, true, false, ctrlOff[1], e, mp, () => { for (int i = 0; i < fleet.Length; i++) fleet[i].placed = false; dragIdx = -1; Sfx(clipClick, 0.7f); });
-            SetupButton(ctrlR[2], ctrlLbl[2], rowFont, AllPlaced(), false, ctrlOff[2], e, mp,
-                () => { Sfx(clipFlip, 0.8f); SyncBoard(); phase = Phase.Playing; targeting = false; message = "Your turn — tap TARGET to fire."; });
+            bool startEnabled = AllPlaced() && !(online && onlineWaiting);
+            SetupButton(ctrlR[2], ctrlLbl[2], rowFont, startEnabled, false, ctrlOff[2], e, mp,
+                () =>
+                {
+                    Sfx(clipFlip, 0.8f);
+                    SyncBoard();
+                    if (online) { net.SendFleetReady(); onlineWaiting = true; message = "Fleet locked - waiting for opponent..."; }
+                    else { phase = Phase.Playing; targeting = false; message = "Your turn — tap TARGET to fire."; }
+                });
         }
 
         // the 5-ship dock (right panel, middle): each unplaced ship sits in a berth, click to pick up
@@ -1515,6 +1563,11 @@ namespace Battleship
             { "Connecting...", "Connexion..." }, { "Error: ", "Erreur : " },
             { "RELAY LINKED - PING OK", "RELAIS CONNECTE - PING OK" }, { "RELAY LINKED", "RELAIS CONNECTE" },
             { "RELAY LINKING...", "CONNEXION RELAIS..." },
+            { "PLACE FLEET", "PLACER LA FLOTTE" },   // "READY" is already in the table below
+            { "YOUR TURN", "VOTRE TOUR" }, { "OPPONENT'S TURN", "TOUR DE L'ADVERSAIRE" },
+            { "Place your fleet, then READY.", "Placez votre flotte, puis PRET." },
+            { "Fleet locked - waiting for opponent...", "Flotte verrouillee - attente de l'adversaire..." },
+            { "Online moves arrive in the next step.", "Les coups en ligne arrivent bientot." },
             // setup panel (legacy text panel — kept for reference)
             { "AI Difficulty", "Difficulte IA" }, { "Rotate (R)", "Pivoter (R)" }, { "Randomize", "Aleatoire" },
             { "Clear", "Effacer" }, { "▶ Start", "▶ Demarrer" }, { "Drag ships to the board:", "Glissez les navires sur la grille :" },
@@ -2457,6 +2510,7 @@ namespace Battleship
 
         private void FireAt(int gx, int gy)
         {
+            if (OnlineActionBlocked()) return;
             var res = match.PlayerFire(gx, gy);
             if (res.Outcome == FireOutcome.Invalid) return;
             Sfx(clipFire);
@@ -2498,6 +2552,7 @@ namespace Battleship
 
         private void TryTorpedo(int gx)
         {
+            if (OnlineActionBlocked()) return;
             if (!match.PlayerTorpedo(gx)) return;
             perkMode = PerkMode.None;
             Sfx(clipPeriscope); // then the torpedo LOOP takes over when the fish launches (see Update)
@@ -2799,6 +2854,7 @@ namespace Battleship
 
         private void HandleRelocate(float ox, float oy, Event e, Vector2 mp)
         {
+            if (online) return;   // online relocate isn't wired yet (Step 7)
             int cx = Mathf.FloorToInt((mp.x - ox) / cs), cy = Mathf.FloorToInt((mp.y - oy) / cs);
             bool over = cx >= 0 && cx < Board.Size && cy >= 0 && cy < Board.Size;
             if (e.type == EventType.Repaint && over)
@@ -2839,6 +2895,7 @@ namespace Battleship
 
         private void HandleIntercept(float ox, float oy, Event e, Vector2 mp)
         {
+            if (online) return;   // online intercept isn't wired yet (Step 7)
             if (e.type != EventType.MouseDown || e.button != 0) return;
             int cx = Mathf.FloorToInt((mp.x - ox) / cs), cy = Mathf.FloorToInt((mp.y - oy) / cs);
             if (cx < 0 || cx >= Board.Size || cy < 0 || cy >= Board.Size) return;
@@ -3568,6 +3625,7 @@ namespace Battleship
         // or confirms the pending enemy turn instead of waiting out the countdown
         private void SkipTurn(bool timeout)
         {
+            if (OnlineActionBlocked()) return;
             match.PlayerPass();
             turnDeadline = -1f; perkMode = PerkMode.None; prevPlayerTurn = false;
             targeting = false;          // enemy turn ALWAYS plays out on your fleet view
@@ -3739,6 +3797,7 @@ namespace Battleship
 
         private void DoRadar()
         {
+            if (OnlineActionBlocked()) return;
             var c = match.PlayerRadar();
             if (c == null) { message = "NO NEW CONTACTS."; return; }
             pendX = c.Value.x; pendY = c.Value.y;        // blip revealed when the plane exits the top

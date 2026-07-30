@@ -40,6 +40,12 @@ namespace Battleship
         private ISession session;
         private PikeTransport transport;
 
+        // Step 4 — match-start handshake
+        private bool localReady, remoteReady, matchStarted;
+        /// <summary>Fires once when both fleets are ready and the match begins.
+        /// The bool is "am I first" from this client's perspective.</summary>
+        public event Action<bool> OnMatchStart;
+
         public bool InSession => session != null;
 
         // ---- entry points (fire-and-forget; the UI polls the fields above) ----
@@ -95,6 +101,7 @@ namespace Battleship
             var s = session;
             session = null; transport = null;   // the SDK calls transport.StopAsync as the session network tears down
             State = Status.Offline; JoinCode = ""; PlayerCount = 0; Error = ""; IsHost = false; PingOk = false;
+            localReady = remoteReady = matchStarted = false;
             if (s != null) { try { await s.LeaveAsync(); } catch { /* best-effort on the way out */ } }
         }
 
@@ -131,10 +138,40 @@ namespace Battleship
                     PingOk = true;                                        // host saw the reply -> link proven
                     Debug.Log("[PikeNet] Relay round-trip OK");
                     break;
+                case NetMsg.FleetReady:
+                    remoteReady = true;
+                    TryStartMatch();                                      // host may now have both readies
+                    break;
+                case NetMsg.MatchStart:
+                    if (!matchStarted)                                    // guest: host has decided the first turn
+                    {
+                        matchStarted = true;
+                        bool guestFirst = data.Length > 1 && data[1] == 1;
+                        OnMatchStart?.Invoke(guestFirst);                 // "am I first" for the guest
+                    }
+                    break;
             }
         }
 
         private void OnRelayDisconnected() { PingOk = false; }
+
+        /// <summary>Called when THIS client has placed its fleet and pressed READY.</summary>
+        public void SendFleetReady()
+        {
+            localReady = true;
+            transport?.Send(new byte[] { (byte)NetMsg.FleetReady });
+            TryStartMatch();
+        }
+
+        // Host-only: once both fleets are ready, pick who shoots first and broadcast MatchStart.
+        private void TryStartMatch()
+        {
+            if (matchStarted || !IsHost || !localReady || !remoteReady) return;
+            matchStarted = true;
+            const byte hostFirst = 0;   // 0 = host shoots first (balance/randomize later)
+            transport?.Send(new byte[] { (byte)NetMsg.MatchStart, hostFirst });
+            OnMatchStart?.Invoke(hostFirst == 0);   // host is first when hostFirst==0
+        }
 
         /// <summary>Keep only A–Z / 0–9 (uppercased) — the exact character set UGS join codes use.
         /// Used both to filter the JOIN text field live and to clean the code before joining, so a
@@ -180,6 +217,7 @@ namespace Battleship
         {
             session = null; transport = null;
             State = Status.Offline; PlayerCount = 0; JoinCode = ""; IsHost = false; PingOk = false;
+            localReady = remoteReady = matchStarted = false;
         }
 
         private void Fail(Exception ex)

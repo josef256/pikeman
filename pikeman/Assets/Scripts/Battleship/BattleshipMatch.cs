@@ -56,6 +56,11 @@ namespace Battleship
             rng = new System.Random(seed * 31 + 7);
         }
 
+        /// <summary>Online 1v1 start: set which side shoots first, from THIS client's perspective
+        /// (true = my turn). No AI is driven in online mode — BattleshipController skips the AI pump
+        /// when online, and opponent moves arrive over the network instead.</summary>
+        public void SetOnlineStart(bool myTurn) { PlayerTurn = myTurn; }
+
         private void EndPlayerTurn() { PlayerPerks.TurnCount++; PlayerTurn = false; }
 
         /// <summary>Player ran out the turn clock: no shot fired, the turn just passes.</summary>
