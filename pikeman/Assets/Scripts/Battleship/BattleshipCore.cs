@@ -61,28 +61,43 @@ namespace Battleship
         private readonly bool[,] shot = new bool[Size, Size];
         private readonly List<Ship> ships = new();
 
+        // ---- fog-of-war view (online attacker side): the opponent's board, learned only from results ----
+        // A fog board is never Place()d — no real layout is held. Outcomes reported by the defender are
+        // recorded via ApplyKnownResult. Real (placed) boards leave all of this empty, so every query
+        // below behaves exactly as before for single-player.
+        private bool fog;                                            // true = this is a fog view
+        private int fogShipCount, fogSunkCount;                      // total / sunk enemy ships
+        private readonly bool[,] fogHit = new bool[Size, Size];      // cell known to hold an enemy ship
+        private readonly bool[,] fogSunkCell = new bool[Size, Size]; // cell of a fully-sunk enemy ship
+
         public Board() => Clear();
 
         public void Clear()
         {
             ships.Clear();
+            fog = false; fogShipCount = fogSunkCount = 0;
             for (int y = 0; y < Size; y++)
-                for (int x = 0; x < Size; x++) { shipAt[x, y] = -1; shot[x, y] = false; }
+                for (int x = 0; x < Size; x++)
+                { shipAt[x, y] = -1; shot[x, y] = false; fogHit[x, y] = false; fogSunkCell[x, y] = false; }
         }
 
         public static bool InBounds(int x, int y) => x >= 0 && x < Size && y >= 0 && y < Size;
         public bool IsShot(int x, int y) => InBounds(x, y) && shot[x, y];
-        public bool HasShip(int x, int y) => InBounds(x, y) && shipAt[x, y] >= 0;
+        public bool HasShip(int x, int y) => InBounds(x, y) && (shipAt[x, y] >= 0 || fogHit[x, y]);
         public int ShipCount => ships.Count;
 
         public int ShipsRemaining
         {
-            get { int c = 0; foreach (var s in ships) if (!s.Sunk) c++; return c; }
+            get { if (fog) return fogShipCount - fogSunkCount; int c = 0; foreach (var s in ships) if (!s.Sunk) c++; return c; }
         }
 
         public bool AllSunk
         {
-            get { if (ships.Count == 0) return false; foreach (var s in ships) if (!s.Sunk) return false; return true; }
+            get
+            {
+                if (fog) return fogShipCount > 0 && fogSunkCount >= fogShipCount;
+                if (ships.Count == 0) return false; foreach (var s in ships) if (!s.Sunk) return false; return true;
+            }
         }
 
         public bool CanPlace(ShipType type, int x, int y, Orientation o)
@@ -205,6 +220,7 @@ namespace Battleship
         /// <summary>True if the cell holds a ship that is now fully sunk (for reveal on enemy board).</summary>
         public bool IsSunkAt(int x, int y)
         {
+            if (fog) return InBounds(x, y) && fogSunkCell[x, y];
             int idx = shipAt[x, y];
             return idx >= 0 && ships[idx].Sunk;
         }
@@ -222,6 +238,51 @@ namespace Battleship
                     if (Place(t, x, y, o)) break;
                 }
             }
+        }
+
+        // ---- fog-of-war API (online: the attacker's view of the opponent's board) ----
+
+        /// <summary>Turn this board into a fog view of the opponent's fleet. No layout is placed;
+        /// outcomes arrive one shot at a time through <see cref="ApplyKnownResult"/>.</summary>
+        public void InitFog(int enemyShipCount = 5)
+        {
+            Clear();
+            fog = true;
+            fogShipCount = enemyShipCount;
+        }
+
+        /// <summary>Fog board: record a shot's outcome as the defender reported it. On a Sunk result the
+        /// defender also passes the whole ship footprint (<paramref name="sunkCells"/>) so the sink can be
+        /// drawn on every one of its already-hit cells. No ship layout is ever inferred here.</summary>
+        public void ApplyKnownResult(int x, int y, FireResult result, IReadOnlyList<(int x, int y)> sunkCells = null)
+        {
+            if (!fog || !InBounds(x, y)) return;
+            shot[x, y] = true;
+            switch (result.Outcome)
+            {
+                case FireOutcome.Hit:
+                    fogHit[x, y] = true;
+                    break;
+                case FireOutcome.Sunk:
+                    fogHit[x, y] = true;
+                    fogSunkCount++;
+                    if (sunkCells != null && sunkCells.Count > 0)
+                        foreach (var c in sunkCells)
+                        { if (!InBounds(c.x, c.y)) continue; shot[c.x, c.y] = true; fogHit[c.x, c.y] = true; fogSunkCell[c.x, c.y] = true; }
+                    else
+                        fogSunkCell[x, y] = true;
+                    break;
+                // Miss / Intercepted / Invalid: the shot marker alone (renders as water/miss).
+            }
+        }
+
+        /// <summary>Fog board: the opponent relocated a ship out of these cells — their hit markers revert
+        /// to water (misses), exactly what the defender's own board shows after a Relocate.</summary>
+        public void FogForget(IReadOnlyList<(int x, int y)> cells)
+        {
+            if (!fog || cells == null) return;
+            foreach (var c in cells)
+                if (InBounds(c.x, c.y)) { fogHit[c.x, c.y] = false; fogSunkCell[c.x, c.y] = false; }
         }
     }
 }

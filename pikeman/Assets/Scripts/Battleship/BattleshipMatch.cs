@@ -19,6 +19,7 @@ namespace Battleship
             public bool Quiet;                        // enemy scouted instead of firing
             public List<(int x, int y)> Vacated;      // cells whose markers vanished (for UI cleanup)
             public int TorpedoCol = -1;               // >= 0: this turn was a torpedo run down that column
+            public (int x, int y)? Revealed;          // online radar: a cell of MY fleet revealed to the opponent
         }
 
         public Board PlayerBoard { get; } = new();
@@ -59,7 +60,15 @@ namespace Battleship
         /// <summary>Online 1v1 start: set which side shoots first, from THIS client's perspective
         /// (true = my turn). No AI is driven in online mode — BattleshipController skips the AI pump
         /// when online, and opponent moves arrive over the network instead.</summary>
-        public void SetOnlineStart(bool myTurn) { PlayerTurn = myTurn; }
+        public void SetOnlineStart(bool myTurn)
+        {
+            PlayerTurn = myTurn;
+            // Online never calls SetupEnemy, so seed the match RNG here. It only picks THIS client's own
+            // radar-reveal cells (chosen locally by the defender, then sent explicitly) — nothing about it
+            // needs to match the peer, so any seed is fine.
+            rng ??= new System.Random(0x50494B45);   // "PIKE"
+            EnemyBoard.InitFog();                     // my view of the opponent's fleet starts as pure fog
+        }
 
         private void EndPlayerTurn() { PlayerPerks.TurnCount++; PlayerTurn = false; }
 
@@ -332,5 +341,96 @@ namespace Battleship
             }
             return false;
         }
+
+        // ---------------- online: apply an opponent's decided move (defender side) ----------------
+        // Online the remote player takes the AI's structural seat: they attack my PlayerBoard and their
+        // perk state lives in EnemyPerks. These methods take the attacker's DECISION (received over the
+        // wire) and resolve it against my real board, returning the same AiTurn the render path already
+        // animates. No AI runs and no RNG crosses the wire — every random attacker choice (scorch splash
+        // cell, torpedo column) arrives explicitly in the message. Their mirror image on the outgoing
+        // side is EnemyBoard's fog (RecordMyShot / ApplyKnownResult).
+
+        /// <summary>Opponent fired at me, with an optional scorch splash cell THEY chose. Resolves against
+        /// my board — my Intercept may counter it — and returns the shots for rendering.</summary>
+        public AiTurn ApplyOpponentFire(int x, int y, bool scorch, (int x, int y)? splash)
+        {
+            var turn = new AiTurn();
+            if (Over || PlayerTurn) return turn;
+            var r = Resolve(PlayerBoard, PlayerPerks, x, y);
+            if (r.Outcome != FireOutcome.Invalid)
+                turn.Shots.Add(new ShotEvent { X = x, Y = y, Result = r });
+            if (scorch)
+            {
+                EnemyPerks.Use(ShipType.Battleship);
+                if (splash.HasValue)
+                {
+                    var sr = Resolve(PlayerBoard, PlayerPerks, splash.Value.x, splash.Value.y);
+                    if (sr.Outcome != FireOutcome.Invalid)
+                        turn.Shots.Add(new ShotEvent { X = splash.Value.x, Y = splash.Value.y, Result = sr });
+                }
+            }
+            EndAiTurn();
+            return turn;
+        }
+
+        /// <summary>Opponent torpedoed a column of my board. I own the layout, so I resolve which cell the
+        /// fish strikes (first undamaged cell from the top — the opponent's side).</summary>
+        public AiTurn ApplyOpponentTorpedo(int col)
+        {
+            var turn = new AiTurn();
+            if (Over || PlayerTurn) return turn;
+            EnemyPerks.Use(ShipType.Submarine);
+            turn.TorpedoCol = col;
+            if (col >= 0 && col < Board.Size)
+            {
+                var tt = TorpedoTarget(PlayerBoard, col, 0, (0, 1));
+                if (tt.HasValue)
+                {
+                    var tr = Resolve(PlayerBoard, PlayerPerks, tt.Value.x, tt.Value.y);
+                    if (tr.Outcome != FireOutcome.Invalid)
+                        turn.Shots.Add(new ShotEvent { X = tt.Value.x, Y = tt.Value.y, Result = tr });
+                }
+            }
+            EndAiTurn();
+            return turn;
+        }
+
+        /// <summary>Opponent relocated their damaged destroyer. It moved on their real board; on my fog the
+        /// vacated cells' hit markers revert to water — I never learn where it went.</summary>
+        public AiTurn ApplyOpponentRelocate(List<(int x, int y)> vacated)
+        {
+            var turn = new AiTurn();
+            if (Over || PlayerTurn) return turn;
+            EnemyPerks.Use(ShipType.Destroyer);
+            EnemyBoard.FogForget(vacated);
+            turn.Relocated = true;
+            turn.Vacated = vacated;
+            EndAiTurn();
+            return turn;
+        }
+
+        /// <summary>Opponent scouted my fleet. I own that info, so I pick the revealed cell here (in
+        /// turn.Revealed, to send back for their fog). Consumes the turn as a quiet recon turn.</summary>
+        public AiTurn ApplyOpponentRadar()
+        {
+            var turn = new AiTurn();
+            if (Over || PlayerTurn) return turn;
+            EnemyPerks.Use(ShipType.Carrier);
+            turn.Quiet = true;
+            turn.Revealed = PickRadarCell(PlayerBoard, null);
+            EndAiTurn();
+            return turn;
+        }
+
+        // ---- online: fold MY resolved move into the fog board and pass the turn ----
+
+        /// <summary>Online: record the result of MY shot (resolved by the opponent) onto the fog board.
+        /// For a sunk ship the opponent also sends the footprint. Does NOT end the turn — call
+        /// <see cref="EndMyOnlineTurn"/> once all cells of the move are recorded (main + scorch splash).</summary>
+        public void RecordMyShot(int x, int y, FireResult result, List<(int x, int y)> sunkCells = null)
+            => EnemyBoard.ApplyKnownResult(x, y, result, sunkCells);
+
+        /// <summary>Online: end MY turn after my move's results have been folded into the fog board.</summary>
+        public void EndMyOnlineTurn() => EndPlayerTurn();
     }
 }
