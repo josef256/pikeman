@@ -61,6 +61,30 @@ namespace Battleship
         public static byte[] EncodeRadar()
             => new byte[] { (byte)MoveKind.Radar };
 
+        // Relocate is fire-and-forget (like Pass): I move my own destroyer locally and just tell the
+        // opponent which cells it vacated so their fog reverts those hit markers to water. No result comes
+        // back. Body: [Relocate, count, x, y, ...].
+        public static byte[] EncodeRelocate(List<(int x, int y)> cells)
+        {
+            int n = cells?.Count ?? 0;
+            var buf = new byte[2 + n * 2];
+            buf[0] = (byte)MoveKind.Relocate;
+            buf[1] = (byte)n;
+            for (int i = 0; i < n; i++) { buf[2 + i * 2] = (byte)cells[i].x; buf[3 + i * 2] = (byte)cells[i].y; }
+            return buf;
+        }
+
+        public static List<(int x, int y)> DecodeRelocate(byte[] body)
+        {
+            var list = new List<(int x, int y)>();
+            if (body == null || body.Length < 2) return list;
+            int i = 1;                        // skip the MoveKind tag at [0]
+            int n = body[i++];
+            for (int c = 0; c < n && i + 2 <= body.Length; c++)
+                list.Add((body[i++], body[i++]));
+            return list;
+        }
+
         // Scorch rides on a Fire intent: [Fire, x, y, 1] plus, when a splash cell exists, [sx, sy].
         // byte3 is the scorch flag (so scorch-with-no-valid-splash still tells the defender to burn the
         // perk); the splash cell is present only when the body reaches length 6. Plain fire stays length 3.

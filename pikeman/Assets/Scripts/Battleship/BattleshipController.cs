@@ -1337,6 +1337,12 @@ namespace Battleship
                         net.SendMoveResult(NetCodec.EncodeReveal(rt.Revealed));
                         PlayIncomingTurn(rt);                          // "enemy recon plane overhead" on my board
                         break;
+                    case MoveKind.Relocate:
+                        // Fire-and-forget (like Pass): forget the vacated cells on my fog, flip to my turn.
+                        var rl = match.ApplyOpponentRelocate(NetCodec.DecodeRelocate(body));
+                        targeting = false; prevPlayerTurn = false; actionEndT = Time.time;
+                        PlayIncomingTurn(rl);                          // "THEIR DAMAGED SHIP ESCAPED!"
+                        break;
                 }
             }
             catch (System.Exception ex)
@@ -3050,7 +3056,6 @@ namespace Battleship
 
         private void HandleRelocate(float ox, float oy, Event e, Vector2 mp)
         {
-            if (online) return;   // online relocate isn't wired yet (Step 7)
             int cx = Mathf.FloorToInt((mp.x - ox) / cs), cy = Mathf.FloorToInt((mp.y - oy) / cs);
             bool over = cx >= 0 && cx < Board.Size && cy >= 0 && cy < Board.Size;
             if (e.type == EventType.Repaint && over)
@@ -3078,6 +3083,9 @@ namespace Battleship
                     }
                     foreach (var c in match.PlayerBoard.ShipCells(ShipType.Destroyer))
                         if (match.PlayerBoard.IsCellDamaged(c.x, c.y)) hitT[c.x, c.y] = Time.time - 999f;
+                    // Online: the move already ended my turn locally (fire-and-forget, like Pass). Tell the
+                    // opponent which cells I vacated so their fog of my destroyer reverts to water.
+                    if (online && old != null) { net.SendMoveIntent(NetCodec.EncodeRelocate(old)); prevPlayerTurn = false; }
                     perkMode = PerkMode.None;
                     message = "Destroyer relocated — the enemy's markers just went stale!";
                     actionEndT = Time.time + relocDur + 0.5f; // let the sail finish
@@ -3089,9 +3097,11 @@ namespace Battleship
             }
         }
 
+        // Intercept is purely local defender state (a shield on my own cell) — nothing crosses the wire.
+        // When the opponent fires there, my ApplyOpponentFire resolves the counter and the attacker just
+        // gets FireOutcome.Intercepted back through the normal result channel. It's a free (no-turn) action.
         private void HandleIntercept(float ox, float oy, Event e, Vector2 mp)
         {
-            if (online) return;   // online intercept isn't wired yet (Step 7)
             if (e.type != EventType.MouseDown || e.button != 0) return;
             int cx = Mathf.FloorToInt((mp.x - ox) / cs), cy = Mathf.FloorToInt((mp.y - oy) / cs);
             if (cx < 0 || cx >= Board.Size || cy < 0 || cy >= Board.Size) return;

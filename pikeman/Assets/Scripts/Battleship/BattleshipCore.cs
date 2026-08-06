@@ -257,6 +257,9 @@ namespace Battleship
         public void ApplyKnownResult(int x, int y, FireResult result, IReadOnlyList<(int x, int y)> sunkCells = null)
         {
             if (!fog || !InBounds(x, y)) return;
+            // An intercepted shot was negated — the defender's board is left un-shot (the shield only stops
+            // ONE shot), so the fog must stay open too or the attacker could never re-target the cell.
+            if (result.Outcome == FireOutcome.Intercepted) return;
             shot[x, y] = true;
             switch (result.Outcome)
             {

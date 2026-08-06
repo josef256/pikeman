@@ -128,7 +128,7 @@ namespace Battleship
             if (Over || !PlayerTurn || !PlayerPerks.Ready(PlayerBoard, ShipType.Destroyer)) return false;
             var vacated = PlayerBoard.Relocate(ShipType.Destroyer, x, y, o);
             if (vacated == null) return false;
-            Ai.ForgetCells(vacated);
+            Ai?.ForgetCells(vacated);   // online there is no AI; the opponent forgets via their own fog instead
             PlayerPerks.Use(ShipType.Destroyer);
             EndPlayerTurn();
             return true;
