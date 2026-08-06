@@ -447,5 +447,10 @@ namespace Battleship
         /// EnemyPerks.Use on their side). Call before <see cref="EndMyOnlineTurn"/> so the cooldown math
         /// matches the single-player path (Use at TurnCount N, then TurnCount++).</summary>
         public void UseMyPerk(ShipType t) => PlayerPerks.Use(t);
+
+        /// <summary>Online: pick MY scorch splash cell off the fog board (a random adjacent, in-bounds, not
+        /// already-shot cell) so I can send it explicitly — the defender resolves it against their real
+        /// board. Null when every neighbour is off-board or already fired at.</summary>
+        public (int x, int y)? PickMyScorchSplash(int x, int y) => PickSplash(EnemyBoard, x, y);
     }
 }

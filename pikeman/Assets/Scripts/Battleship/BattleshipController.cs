@@ -35,6 +35,7 @@ namespace Battleship
         private int pendingFireX, pendingFireY; // online: the cell my in-flight shot targeted
         private MoveKind pendingKind = MoveKind.Fire; // online: which move I'm awaiting a result for
         private int pendingCol;             // online: the column of an in-flight torpedo run
+        private bool pendingScorch;         // online: the in-flight fire carried a scorch splash
         private Lang lang = Lang.EN;        // UI language; persisted in PlayerPrefs, switched from Settings
         private int dragIdx = -1;
         private Orientation orient = Orientation.Horizontal;
@@ -256,7 +257,7 @@ namespace Battleship
             match = new BattleshipMatch();
             match.SetupEnemy(difficulty, seed);
             online = false; onlineWaiting = false;   // single-player by default; StartOnlineSetup re-arms online
-            awaitingResult = false;
+            awaitingResult = false; pendingScorch = false;
             fleet = new FleetShip[Ships.Standard.Length];
             for (int i = 0; i < fleet.Length; i++) fleet[i] = new FleetShip { type = Ships.Standard[i], placed = false };
             dragIdx = -1; orient = Orientation.Horizontal; targeting = false;
@@ -1304,31 +1305,44 @@ namespace Battleship
         private void OnNetMoveIntent(byte[] body)
         {
             if (!online || body == null || body.Length == 0) return;
-            switch ((MoveKind)body[0])
+            // IMPORTANT: resolve + SEND the result BEFORE animating. Rendering must never be able to block
+            // the protocol — if PlayIncomingTurn ever throws, the attacker still gets its result and the
+            // match can't deadlock. The whole handler is guarded so any fault surfaces instead of hanging.
+            try
             {
-                case MoveKind.Pass:
-                    match.ApplyOpponentPass();               // no shots — just flips the turn back to me
-                    targeting = false; prevPlayerTurn = false; actionEndT = Time.time;
-                    message = T("OPPONENT PASSED - YOUR TURN");
-                    break;
-                case MoveKind.Fire:
-                    if (body.Length < 3) return;
-                    int x = body[1], y = body[2];
-                    var t = match.ApplyOpponentFire(x, y, false, null);
-                    PlayIncomingTurn(t);                     // same VFX / audio path the AI uses
-                    net.SendMoveResult(NetCodec.EncodeResult(BuildResults(t))); // hand the attacker their outcome
-                    break;
-                case MoveKind.Torpedo:
-                    if (body.Length < 2) return;
-                    var tt = match.ApplyOpponentTorpedo(body[1]);   // I own my layout — I resolve the struck cell
-                    PlayIncomingTurn(tt);
-                    net.SendMoveResult(NetCodec.EncodeResult(BuildResults(tt)));
-                    break;
-                case MoveKind.Radar:
-                    var rt = match.ApplyOpponentRadar();            // I own my layout — I pick the revealed cell
-                    PlayIncomingTurn(rt);                          // "enemy recon plane overhead" on my board
-                    net.SendMoveResult(NetCodec.EncodeReveal(rt.Revealed));
-                    break;
+                switch ((MoveKind)body[0])
+                {
+                    case MoveKind.Pass:
+                        match.ApplyOpponentPass();               // no shots — just flips the turn back to me
+                        targeting = false; prevPlayerTurn = false; actionEndT = Time.time;
+                        message = T("OPPONENT PASSED - YOUR TURN");
+                        break;
+                    case MoveKind.Fire:
+                        if (body.Length < 3) return;
+                        int x = body[1], y = body[2];
+                        bool scorch = body.Length >= 4 && body[3] == 1;                 // byte3 = scorch flag
+                        (int x, int y)? splash = body.Length >= 6 ? ((int, int)?)(body[4], body[5]) : null;
+                        var t = match.ApplyOpponentFire(x, y, scorch, splash);
+                        net.SendMoveResult(NetCodec.EncodeResult(BuildResults(t))); // hand the attacker their outcome FIRST
+                        PlayIncomingTurn(t);                     // then animate (same VFX / audio path the AI uses)
+                        break;
+                    case MoveKind.Torpedo:
+                        if (body.Length < 2) return;
+                        var tt = match.ApplyOpponentTorpedo(body[1]);   // I own my layout — I resolve the struck cell
+                        net.SendMoveResult(NetCodec.EncodeResult(BuildResults(tt)));
+                        PlayIncomingTurn(tt);
+                        break;
+                    case MoveKind.Radar:
+                        var rt = match.ApplyOpponentRadar();            // I own my layout — I pick the revealed cell
+                        net.SendMoveResult(NetCodec.EncodeReveal(rt.Revealed));
+                        PlayIncomingTurn(rt);                          // "enemy recon plane overhead" on my board
+                        break;
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogError("[Net] OnNetMoveIntent failed: " + ex);
+                message = "NET ERR (defend): " + ex.Message;
             }
         }
 
@@ -1338,22 +1352,34 @@ namespace Battleship
         {
             if (!online) return;
             if (pendingKind == MoveKind.Radar) { OnRadarResult(body); return; } // reveal cell, not a shot list
-            var shots = NetCodec.DecodeResult(body);
-            var evs = new System.Collections.Generic.List<BattleshipMatch.ShotEvent>(shots.Count);
-            foreach (var s in shots)
+            // Clear the await + end my turn BEFORE animating, and guard the whole thing: a rendering fault
+            // must never strand me on awaitingResult (which would freeze my input for the rest of the match).
+            try
             {
-                var fr = new FireResult(s.Outcome, s.SunkShip);
-                match.RecordMyShot(s.X, s.Y, fr, s.Footprint);   // fog learns the result (a sink reveals the hull)
-                evs.Add(new BattleshipMatch.ShotEvent { X = s.X, Y = s.Y, Result = fr });
+                var shots = NetCodec.DecodeResult(body);
+                var evs = new System.Collections.Generic.List<BattleshipMatch.ShotEvent>(shots.Count);
+                foreach (var s in shots)
+                {
+                    var fr = new FireResult(s.Outcome, s.SunkShip);
+                    match.RecordMyShot(s.X, s.Y, fr, s.Footprint);   // fog learns the result (a sink reveals the hull)
+                    evs.Add(new BattleshipMatch.ShotEvent { X = s.X, Y = s.Y, Result = fr });
+                }
+                if (pendingKind == MoveKind.Torpedo) match.UseMyPerk(ShipType.Submarine); // advance my sub cooldown
+                else if (pendingScorch) match.UseMyPerk(ShipType.Battleship);              // advance my scorch cooldown
+                match.EndMyOnlineTurn();
+                awaitingResult = false;
+                targeting = true;                                    // stay on the scope to watch the ordnance land
+                if (pendingKind == MoveKind.Torpedo)
+                    RenderMyTorpedo(pendingCol, evs);                // fish run from the reported struck cell
+                else
+                    RenderMyShots(evs, pendingFireX, pendingFireY);  // shell salvo; handles the YOU WIN check
             }
-            if (pendingKind == MoveKind.Torpedo) match.UseMyPerk(ShipType.Submarine); // advance my sub cooldown
-            match.EndMyOnlineTurn();
-            awaitingResult = false;
-            targeting = true;                                    // stay on the scope to watch the ordnance land
-            if (pendingKind == MoveKind.Torpedo)
-                RenderMyTorpedo(pendingCol, evs);                // fish run from the reported struck cell
-            else
-                RenderMyShots(evs, pendingFireX, pendingFireY);  // shell salvo; handles the YOU WIN check
+            catch (System.Exception ex)
+            {
+                awaitingResult = false;                              // never hard-freeze on a render/decode fault
+                Debug.LogError("[Net] OnNetMoveResult failed: " + ex);
+                message = "NET ERR (attack): " + ex.Message;
+            }
         }
 
         // I am the ATTACKER: the defender scouted their own board and reported the cell to reveal (or none).
@@ -1361,12 +1387,21 @@ namespace Battleship
         // resolve it myself. The turn is consumed either way (mirrors the defender's ApplyOpponentRadar).
         private void OnRadarResult(byte[] body)
         {
-            var cell = NetCodec.DecodeReveal(body);
-            match.UseMyPerk(ShipType.Carrier);
-            match.EndMyOnlineTurn();
-            awaitingResult = false;
-            targeting = true;
-            RenderMyRadar(cell);
+            try
+            {
+                var cell = NetCodec.DecodeReveal(body);
+                match.UseMyPerk(ShipType.Carrier);
+                match.EndMyOnlineTurn();
+                awaitingResult = false;
+                targeting = true;
+                RenderMyRadar(cell);
+            }
+            catch (System.Exception ex)
+            {
+                awaitingResult = false;
+                Debug.LogError("[Net] OnRadarResult failed: " + ex);
+                message = "NET ERR (attack): " + ex.Message;
+            }
         }
 
         // Package the shots I resolved (against my own board) into wire results, attaching each sunk
@@ -2635,7 +2670,14 @@ namespace Battleship
             awaitingResult = true;
             pendingKind = MoveKind.Fire;
             pendingFireX = gx; pendingFireY = gy;
-            net.SendMoveIntent(NetCodec.EncodeFire(gx, gy));
+            pendingScorch = match.ScorchArmed;
+            if (pendingScorch)
+            {
+                var splash = match.PickMyScorchSplash(gx, gy);   // I choose the splash cell and send it
+                match.ArmScorch(false);                          // clear the armed flag; perk consumed on result
+                net.SendMoveIntent(NetCodec.EncodeScorchFire(gx, gy, splash));
+            }
+            else net.SendMoveIntent(NetCodec.EncodeFire(gx, gy));
             Sfx(clipClick, 0.7f);
             message = string.Format(T("FIRING {0}..."), Coord(gx, gy));
         }

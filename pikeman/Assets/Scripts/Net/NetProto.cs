@@ -61,6 +61,14 @@ namespace Battleship
         public static byte[] EncodeRadar()
             => new byte[] { (byte)MoveKind.Radar };
 
+        // Scorch rides on a Fire intent: [Fire, x, y, 1] plus, when a splash cell exists, [sx, sy].
+        // byte3 is the scorch flag (so scorch-with-no-valid-splash still tells the defender to burn the
+        // perk); the splash cell is present only when the body reaches length 6. Plain fire stays length 3.
+        public static byte[] EncodeScorchFire(int x, int y, (int x, int y)? splash)
+            => splash.HasValue
+                ? new byte[] { (byte)MoveKind.Fire, (byte)x, (byte)y, 1, (byte)splash.Value.x, (byte)splash.Value.y }
+                : new byte[] { (byte)MoveKind.Fire, (byte)x, (byte)y, 1 };
+
         // ---- MoveResult body (defender -> attacker) ----
         // Layout: [shotCount] then per shot [x][y][outcome][sunkShip][fpCount] [fx][fy] * fpCount
 
