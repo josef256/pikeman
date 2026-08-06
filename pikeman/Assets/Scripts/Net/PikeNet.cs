@@ -46,6 +46,13 @@ namespace Battleship
         /// The bool is "am I first" from this client's perspective.</summary>
         public event Action<bool> OnMatchStart;
 
+        // Step 6 — in-match moves. PikeNet stays a byte pipe here: the bodies are built and parsed by
+        // the game layer (NetCodec), so no game rules leak into the connection code.
+        /// <summary>Attacker's decided move arrived — the defender resolves it. Arg = the tag-free body.</summary>
+        public event Action<byte[]> OnMoveIntent;
+        /// <summary>Defender's resolved outcome arrived — the attacker applies it. Arg = the tag-free body.</summary>
+        public event Action<byte[]> OnMoveResult;
+
         public bool InSession => session != null;
 
         // ---- entry points (fire-and-forget; the UI polls the fields above) ----
@@ -150,7 +157,38 @@ namespace Battleship
                         OnMatchStart?.Invoke(guestFirst);                 // "am I first" for the guest
                     }
                     break;
+                case NetMsg.MoveIntent:
+                    OnMoveIntent?.Invoke(Body(data));                     // defender: resolve the attacker's move
+                    break;
+                case NetMsg.MoveResult:
+                    OnMoveResult?.Invoke(Body(data));                     // attacker: apply the resolved outcome
+                    break;
             }
+        }
+
+        /// <summary>Strip the leading NetMsg tag, handing the game layer just the message body.</summary>
+        private static byte[] Body(byte[] data)
+        {
+            var b = new byte[data.Length - 1];
+            Array.Copy(data, 1, b, 0, b.Length);
+            return b;
+        }
+
+        // ---- Step 6: send an in-match move (attacker) / its resolved result (defender) ----
+
+        /// <summary>Send my decided move to the opponent (I am the attacker this turn).</summary>
+        public bool SendMoveIntent(byte[] body) => SendTagged(NetMsg.MoveIntent, body);
+
+        /// <summary>Send the resolved outcome back to the attacker (I am the defender this turn).</summary>
+        public bool SendMoveResult(byte[] body) => SendTagged(NetMsg.MoveResult, body);
+
+        private bool SendTagged(NetMsg tag, byte[] body)
+        {
+            int n = body?.Length ?? 0;
+            var buf = new byte[1 + n];
+            buf[0] = (byte)tag;
+            if (n > 0) Array.Copy(body, 0, buf, 1, n);
+            return transport != null && transport.Send(buf);
         }
 
         private void OnRelayDisconnected() { PingOk = false; }

@@ -409,6 +409,16 @@ namespace Battleship
             return turn;
         }
 
+        /// <summary>Opponent ended their turn without firing. No shots to resolve — the turn just
+        /// passes back to me (mirrors PlayerPass on their side).</summary>
+        public AiTurn ApplyOpponentPass()
+        {
+            var turn = new AiTurn();
+            if (Over || PlayerTurn) return turn;
+            EndAiTurn();
+            return turn;
+        }
+
         /// <summary>Opponent scouted my fleet. I own that info, so I pick the revealed cell here (in
         /// turn.Revealed, to send back for their fog). Consumes the turn as a quiet recon turn.</summary>
         public AiTurn ApplyOpponentRadar()

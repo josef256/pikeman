@@ -31,6 +31,8 @@ namespace Battleship
         private string netCodeEntry = "";   // room code the guest is typing in the JOIN field
         private bool online = false;        // true while in a networked 1v1 (disables the AI)
         private bool onlineWaiting = false; // pressed READY, waiting for the opponent's fleet
+        private bool awaitingResult = false;// online: fired an intent, waiting for the defender's result
+        private int pendingFireX, pendingFireY; // online: the cell my in-flight shot targeted
         private Lang lang = Lang.EN;        // UI language; persisted in PlayerPrefs, switched from Settings
         private int dragIdx = -1;
         private Orientation orient = Orientation.Horizontal;
@@ -233,6 +235,8 @@ namespace Battleship
             lang = (Lang)Mathf.Clamp(PlayerPrefs.GetInt("pk_lang", 0), 0, 1);
             net = new PikeNet();
             net.OnMatchStart += BeginOnlineMatch;   // both fleets ready -> drop into Playing in sync
+            net.OnMoveIntent += OnNetMoveIntent;    // opponent's decided move -> resolve on my board (defender)
+            net.OnMoveResult += OnNetMoveResult;    // my shot's outcome -> fold into fog + animate (attacker)
             NewGame();
             phase = Phase.Menu; // first screen on launch is the home menu, not fleet setup
         }
@@ -250,6 +254,7 @@ namespace Battleship
             match = new BattleshipMatch();
             match.SetupEnemy(difficulty, seed);
             online = false; onlineWaiting = false;   // single-player by default; StartOnlineSetup re-arms online
+            awaitingResult = false;
             fleet = new FleetShip[Ships.Standard.Length];
             for (int i = 0; i < fleet.Length; i++) fleet[i] = new FleetShip { type = Ships.Standard[i], placed = false };
             dragIdx = -1; orient = Orientation.Horizontal; targeting = false;
@@ -634,9 +639,15 @@ namespace Battleship
             if (match.PlayerTurn || match.Over) return;
             aiTimer -= Time.deltaTime;
             if (aiTimer <= 0f)
-            {
+                PlayIncomingTurn(match.AiFire());
+        }
+
+        // Render one resolved enemy turn — the AI's own move in single-player, or the opponent's
+        // decided move arriving over the network (ApplyOpponent*). Both hand in the same AiTurn, so the
+        // whole VFX / audio / message path below is shared verbatim (Step 6).
+        private void PlayIncomingTurn(BattleshipMatch.AiTurn t)
+        {
                 targeting = false; // enemy turn begins — the ONLY auto-switch back to your ships screen
-                var t = match.AiFire();
                 float lockT = Time.time + 0.5f;
                 if (t.Relocated)
                 {
@@ -720,8 +731,12 @@ namespace Battleship
                     QueueMsg(msg, lockT - 0.4f);
                 }
                 lockUntil = lockT;
-                if (match.PlayerBoard.AllSunk) { phase = Phase.Over; QueueMsg("YOUR FLEET IS DESTROYED — AI WINS.", lockT); QueueSfx(Time.time + 1.3f, clipLose); }
-            }
+                if (match.PlayerBoard.AllSunk)
+                {
+                    phase = Phase.Over;
+                    QueueMsg(online ? "YOUR FLEET IS DESTROYED - YOU LOSE." : "YOUR FLEET IS DESTROYED — AI WINS.", lockT);
+                    QueueSfx(Time.time + 1.3f, clipLose);
+                }
         }
 
         private void EnsureStyles()
@@ -1270,13 +1285,72 @@ namespace Battleship
             message = myTurn ? "YOUR TURN" : "OPPONENT'S TURN";
         }
 
-        // Temporary guard: in an online match, the move seams (fire/torpedo/perks) aren't wired to the
-        // network yet — that's Steps 6-7. Block them locally so they can't desync the two games.
+        // The perk seams (torpedo / relocate / intercept / radar) still can't cross the wire — that's
+        // Step 7. Fire and END TURN are wired (Step 6) and route through their own online branches, so
+        // this guard now only stops the perks from desyncing the two games.
         private bool OnlineActionBlocked()
         {
             if (!online) return false;
-            message = "Online moves arrive in the next step.";
+            message = T("Not available online yet.");
             return true;
+        }
+
+        // ---- Step 6: in-match network moves ----
+
+        // I am the DEFENDER: the opponent's decided move arrived. Resolve it against my real board (my
+        // Intercept can counter it), animate it exactly like an AI turn, then report the outcome back.
+        private void OnNetMoveIntent(byte[] body)
+        {
+            if (!online || body == null || body.Length == 0) return;
+            switch ((MoveKind)body[0])
+            {
+                case MoveKind.Pass:
+                    match.ApplyOpponentPass();               // no shots — just flips the turn back to me
+                    targeting = false; prevPlayerTurn = false; actionEndT = Time.time;
+                    message = T("OPPONENT PASSED - YOUR TURN");
+                    break;
+                case MoveKind.Fire:
+                    if (body.Length < 3) return;
+                    int x = body[1], y = body[2];
+                    var t = match.ApplyOpponentFire(x, y, false, null);
+                    PlayIncomingTurn(t);                     // same VFX / audio path the AI uses
+                    net.SendMoveResult(NetCodec.EncodeResult(BuildResults(t))); // hand the attacker their outcome
+                    break;
+            }
+        }
+
+        // I am the ATTACKER: the defender resolved my shot. Fold each cell into my fog board, end my
+        // turn, then animate the shells landing on the targeting scope from the reported outcome.
+        private void OnNetMoveResult(byte[] body)
+        {
+            if (!online) return;
+            var shots = NetCodec.DecodeResult(body);
+            var evs = new System.Collections.Generic.List<BattleshipMatch.ShotEvent>(shots.Count);
+            foreach (var s in shots)
+            {
+                var fr = new FireResult(s.Outcome, s.SunkShip);
+                match.RecordMyShot(s.X, s.Y, fr, s.Footprint);   // fog learns the result (a sink reveals the hull)
+                evs.Add(new BattleshipMatch.ShotEvent { X = s.X, Y = s.Y, Result = fr });
+            }
+            match.EndMyOnlineTurn();
+            awaitingResult = false;
+            targeting = true;                                    // stay on the scope to watch my shells land
+            RenderMyShots(evs, pendingFireX, pendingFireY);      // handles the YOU WIN check off the fog board
+        }
+
+        // Package the shots I resolved (against my own board) into wire results, attaching each sunk
+        // ship's full footprint so the attacker's fog can reveal the whole hull.
+        private System.Collections.Generic.List<ShotResult> BuildResults(BattleshipMatch.AiTurn t)
+        {
+            var list = new System.Collections.Generic.List<ShotResult>(t.Shots.Count);
+            foreach (var ev in t.Shots)
+            {
+                var r = new ShotResult { X = ev.X, Y = ev.Y, Outcome = ev.Result.Outcome, SunkShip = ev.Result.SunkShip };
+                if (ev.Result.Outcome == FireOutcome.Sunk)
+                    r.Footprint = match.PlayerBoard.ShipCells(ev.Result.SunkShip);
+                list.Add(r);
+            }
+            return list;
         }
 
         // a centred pixel-font label inside a rect; sizeFrac scales the font off the rect height
@@ -1612,6 +1686,11 @@ namespace Battleship
             { "TORPEDO: NO CONTACT.", "TORPILLE : AUCUN CONTACT." },
             { "TORPEDO INTERCEPTED!", "TORPILLE INTERCEPTEE !" },
             { "SALVO AWAY...", "SALVE LANCEE..." }, { "FIRING {0}...", "TIR SUR {0}..." },
+            // online (Step 6)
+            { "Already fired there.", "Deja tire ici." },
+            { "TURN PASSED", "TOUR PASSE" },
+            { "OPPONENT PASSED - YOUR TURN", "ADVERSAIRE A PASSE - A VOUS" },
+            { "Not available online yet.", "Pas encore disponible en ligne." },
             { "📡 CONTACT AT {0}!", "📡 CONTACT EN {0} !" },
             { "Returned to tray.", "Remis dans la reserve." }, { "Placed {0}.", "{0} place." },
             { "Fleet ready — press ▶ Start!", "Flotte prete — appuyez sur ▶ Demarrer !" },
@@ -2510,18 +2589,39 @@ namespace Battleship
 
         private void FireAt(int gx, int gy)
         {
-            if (OnlineActionBlocked()) return;
+            if (online) { FireOnline(gx, gy); return; }
             var res = match.PlayerFire(gx, gy);
             if (res.Outcome == FireOutcome.Invalid) return;
+            RenderMyShots(match.LastPlayerShots, gx, gy);
+        }
+
+        // Online: send a fire intent to the defender and wait for the resolved result (OnNetMoveResult).
+        // I don't hold the enemy layout, so nothing is resolved here — input stays locked until it lands.
+        private void FireOnline(int gx, int gy)
+        {
+            if (!match.PlayerTurn || match.Over || awaitingResult || InputLocked) return;
+            if (match.EnemyBoard.IsShot(gx, gy)) { message = T("Already fired there."); return; }
+            awaitingResult = true;
+            pendingFireX = gx; pendingFireY = gy;
+            net.SendMoveIntent(NetCodec.EncodeFire(gx, gy));
+            Sfx(clipClick, 0.7f);
+            message = string.Format(T("FIRING {0}..."), Coord(gx, gy));
+        }
+
+        // Animate my own shots streaking onto the targeting scope — shared by single-player
+        // (match.LastPlayerShots) and the networked result path (the defender's resolved ShotEvents).
+        // gx/gy is the cell I aimed at. The board state is already mutated before this runs.
+        private void RenderMyShots(System.Collections.Generic.List<BattleshipMatch.ShotEvent> shots, int gx, int gy)
+        {
             Sfx(clipFire);
             // shells show up ON the scope: green flickering contacts streaking from our waters
             // (bottom edge) to their cells — nothing lands until each one gets there.
             // Scorch fires a visible SALVO: one blip per shot, staggered off separate tubes.
-            int n = match.LastPlayerShots.Count;
+            int n = shots.Count;
             float settle = Time.time; string msg = "";
             for (int i = 0; i < n; i++)
             {
-                var ev = match.LastPlayerShots[i];
+                var ev = shots[i];
                 var sv = new ShellVis
                 {
                     from = new Vector2(n > 1 ? 3.4f + i * 2.2f : 4.5f, Board.Size + 1.4f),
@@ -3625,7 +3725,17 @@ namespace Battleship
         // or confirms the pending enemy turn instead of waiting out the countdown
         private void SkipTurn(bool timeout)
         {
-            if (OnlineActionBlocked()) return;
+            if (online)
+            {
+                if (!match.PlayerTurn || match.Over || awaitingResult || InputLocked) return;
+                net.SendMoveIntent(NetCodec.EncodePass());   // tell the opponent it's their turn now
+                match.EndMyOnlineTurn();
+                turnDeadline = -1f; perkMode = PerkMode.None; prevPlayerTurn = false;
+                targeting = false; actionEndT = Time.time;
+                Sfx(clipClick, 0.7f);
+                message = T("TURN PASSED");
+                return;
+            }
             match.PlayerPass();
             turnDeadline = -1f; perkMode = PerkMode.None; prevPlayerTurn = false;
             targeting = false;          // enemy turn ALWAYS plays out on your fleet view
@@ -3649,8 +3759,9 @@ namespace Battleship
         {
             var r = SlotRect(Slot4F);
             bool playing = phase == Phase.Playing && match != null && !match.Over;
-            bool myTurn = playing && match.PlayerTurn && !InputLocked;
-            bool avail = myTurn || (playing && !match.PlayerTurn && Time.time >= actionEndT);
+            bool myTurn = playing && match.PlayerTurn && !InputLocked && !awaitingResult;
+            // online has no AI countdown to confirm, so END TURN is only ever a pass on my own turn
+            bool avail = myTurn || (playing && !online && !match.PlayerTurn && Time.time >= actionEndT);
             bool hover = r.Contains(Event.current.mousePosition);
             if (Event.current.type == EventType.Repaint)
             {
