@@ -33,6 +33,8 @@ namespace Battleship
         private bool onlineWaiting = false; // pressed READY, waiting for the opponent's fleet
         private bool awaitingResult = false;// online: fired an intent, waiting for the defender's result
         private int pendingFireX, pendingFireY; // online: the cell my in-flight shot targeted
+        private MoveKind pendingKind = MoveKind.Fire; // online: which move I'm awaiting a result for
+        private int pendingCol;             // online: the column of an in-flight torpedo run
         private Lang lang = Lang.EN;        // UI language; persisted in PlayerPrefs, switched from Settings
         private int dragIdx = -1;
         private Orientation orient = Orientation.Horizontal;
@@ -1316,6 +1318,12 @@ namespace Battleship
                     PlayIncomingTurn(t);                     // same VFX / audio path the AI uses
                     net.SendMoveResult(NetCodec.EncodeResult(BuildResults(t))); // hand the attacker their outcome
                     break;
+                case MoveKind.Torpedo:
+                    if (body.Length < 2) return;
+                    var tt = match.ApplyOpponentTorpedo(body[1]);   // I own my layout — I resolve the struck cell
+                    PlayIncomingTurn(tt);
+                    net.SendMoveResult(NetCodec.EncodeResult(BuildResults(tt)));
+                    break;
             }
         }
 
@@ -1332,10 +1340,14 @@ namespace Battleship
                 match.RecordMyShot(s.X, s.Y, fr, s.Footprint);   // fog learns the result (a sink reveals the hull)
                 evs.Add(new BattleshipMatch.ShotEvent { X = s.X, Y = s.Y, Result = fr });
             }
+            if (pendingKind == MoveKind.Torpedo) match.UseMyPerk(ShipType.Submarine); // advance my sub cooldown
             match.EndMyOnlineTurn();
             awaitingResult = false;
-            targeting = true;                                    // stay on the scope to watch my shells land
-            RenderMyShots(evs, pendingFireX, pendingFireY);      // handles the YOU WIN check off the fog board
+            targeting = true;                                    // stay on the scope to watch the ordnance land
+            if (pendingKind == MoveKind.Torpedo)
+                RenderMyTorpedo(pendingCol, evs);                // fish run from the reported struck cell
+            else
+                RenderMyShots(evs, pendingFireX, pendingFireY);  // shell salvo; handles the YOU WIN check
         }
 
         // Package the shots I resolved (against my own board) into wire results, attaching each sunk
@@ -2602,6 +2614,7 @@ namespace Battleship
             if (!match.PlayerTurn || match.Over || awaitingResult || InputLocked) return;
             if (match.EnemyBoard.IsShot(gx, gy)) { message = T("Already fired there."); return; }
             awaitingResult = true;
+            pendingKind = MoveKind.Fire;
             pendingFireX = gx; pendingFireY = gy;
             net.SendMoveIntent(NetCodec.EncodeFire(gx, gy));
             Sfx(clipClick, 0.7f);
@@ -2652,11 +2665,33 @@ namespace Battleship
 
         private void TryTorpedo(int gx)
         {
-            if (OnlineActionBlocked()) return;
+            if (online) { TorpedoOnline(gx); return; }
             if (!match.PlayerTorpedo(gx)) return;
+            RenderMyTorpedo(gx, match.LastPlayerShots);
+        }
+
+        // Online: I don't hold the enemy layout, so I can't resolve the run — the defender does. Send the
+        // lane, lock input, and wait for the struck cell in OnNetMoveResult (which calls RenderMyTorpedo).
+        private void TorpedoOnline(int gx)
+        {
+            if (!match.PlayerTurn || match.Over || awaitingResult || InputLocked) return;
+            if (!match.PlayerPerks.Ready(match.PlayerBoard, ShipType.Submarine)) return;
+            awaitingResult = true;
+            pendingKind = MoveKind.Torpedo;
+            pendingCol = gx;
+            perkMode = PerkMode.None;
+            net.SendMoveIntent(NetCodec.EncodeTorpedo(gx));
+            message = "🐟 TORPEDO AWAY...";
+        }
+
+        // Animate my torpedo run — shared by single-player (match.LastPlayerShots) and the networked
+        // result path (the defender's resolved struck cell, 0 or 1 shots). col is the lane I fired.
+        private void RenderMyTorpedo(int col, System.Collections.Generic.List<BattleshipMatch.ShotEvent> shots)
+        {
+            int gx = col;
             perkMode = PerkMode.None;
             Sfx(clipPeriscope); // then the torpedo LOOP takes over when the fish launches (see Update)
-            if (match.LastPlayerShots.Count == 0)
+            if (shots.Count == 0)
             {
                 // empty lane: the fish still runs the whole column and exits at the top, hitting nothing
                 torpVisFrom = new Vector2(gx, 10.4f);
@@ -2670,7 +2705,7 @@ namespace Battleship
             }
             else
             {
-                var ev = match.LastPlayerShots[0];
+                var ev = shots[0];
                 radarIntel.Remove((ev.X, ev.Y));
                 torpVisFrom = new Vector2(gx, 10.4f); // out of your waters, below the board
                 torpVisTo = new Vector2(ev.X, ev.Y);
@@ -3926,7 +3961,7 @@ namespace Battleship
             float bh = btn.fontSize + 12f;
             bool disabled = Perks.IsDisabled(match.PlayerBoard, t);
             int cd = match.PlayerPerks.CooldownLeft(t);
-            bool ready = !disabled && cd <= 0 && match.PlayerTurn && phase == Phase.Playing && !match.Over && !InputLocked;
+            bool ready = !disabled && cd <= 0 && match.PlayerTurn && phase == Phase.Playing && !match.Over && !InputLocked && !awaitingResult;
             string label = disabled ? name + "  ✖ OFFLINE" : cd > 0 ? name + "  (" + cd + ")" : name;
             GUI.enabled = ready;
             if (GUI.Button(new Rect(px, y, pw, bh), label, btn) && act != null) { Sfx(clipClick, 0.7f); act(); }

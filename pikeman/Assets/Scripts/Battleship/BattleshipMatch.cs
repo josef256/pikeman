@@ -442,5 +442,10 @@ namespace Battleship
 
         /// <summary>Online: end MY turn after my move's results have been folded into the fog board.</summary>
         public void EndMyOnlineTurn() => EndPlayerTurn();
+
+        /// <summary>Online: consume one of MY perks (advances my local cooldown to mirror the defender's
+        /// EnemyPerks.Use on their side). Call before <see cref="EndMyOnlineTurn"/> so the cooldown math
+        /// matches the single-player path (Use at TurnCount N, then TurnCount++).</summary>
+        public void UseMyPerk(ShipType t) => PlayerPerks.Use(t);
     }
 }

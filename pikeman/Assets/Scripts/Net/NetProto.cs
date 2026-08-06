@@ -55,6 +55,9 @@ namespace Battleship
         public static byte[] EncodePass()
             => new byte[] { (byte)MoveKind.Pass };
 
+        public static byte[] EncodeTorpedo(int col)
+            => new byte[] { (byte)MoveKind.Torpedo, (byte)col };
+
         // ---- MoveResult body (defender -> attacker) ----
         // Layout: [shotCount] then per shot [x][y][outcome][sunkShip][fpCount] [fx][fy] * fpCount
 
