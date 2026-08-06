@@ -58,6 +58,9 @@ namespace Battleship
         public static byte[] EncodeTorpedo(int col)
             => new byte[] { (byte)MoveKind.Torpedo, (byte)col };
 
+        public static byte[] EncodeRadar()
+            => new byte[] { (byte)MoveKind.Radar };
+
         // ---- MoveResult body (defender -> attacker) ----
         // Layout: [shotCount] then per shot [x][y][outcome][sunkShip][fpCount] [fx][fy] * fpCount
 
@@ -77,6 +80,21 @@ namespace Battleship
                         foreach (var c in s.Footprint) { buf.Add((byte)c.x); buf.Add((byte)c.y); }
                 }
             return buf.ToArray();
+        }
+
+        // ---- Radar MoveResult body (defender -> attacker) ----
+        // Radar returns a single revealed cell (the defender owns their layout, so THEY pick it), not a
+        // shot list. Layout: [hasCell] then, if 1, [x][y]. hasCell==0 means nothing left to reveal.
+
+        public static byte[] EncodeReveal((int x, int y)? cell)
+            => cell.HasValue
+                ? new byte[] { 1, (byte)cell.Value.x, (byte)cell.Value.y }
+                : new byte[] { 0 };
+
+        public static (int x, int y)? DecodeReveal(byte[] body)
+        {
+            if (body == null || body.Length == 0 || body[0] == 0 || body.Length < 3) return null;
+            return (body[1], body[2]);
         }
 
         public static List<ShotResult> DecodeResult(byte[] body)

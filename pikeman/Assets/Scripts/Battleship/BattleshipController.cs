@@ -1324,6 +1324,11 @@ namespace Battleship
                     PlayIncomingTurn(tt);
                     net.SendMoveResult(NetCodec.EncodeResult(BuildResults(tt)));
                     break;
+                case MoveKind.Radar:
+                    var rt = match.ApplyOpponentRadar();            // I own my layout — I pick the revealed cell
+                    PlayIncomingTurn(rt);                          // "enemy recon plane overhead" on my board
+                    net.SendMoveResult(NetCodec.EncodeReveal(rt.Revealed));
+                    break;
             }
         }
 
@@ -1332,6 +1337,7 @@ namespace Battleship
         private void OnNetMoveResult(byte[] body)
         {
             if (!online) return;
+            if (pendingKind == MoveKind.Radar) { OnRadarResult(body); return; } // reveal cell, not a shot list
             var shots = NetCodec.DecodeResult(body);
             var evs = new System.Collections.Generic.List<BattleshipMatch.ShotEvent>(shots.Count);
             foreach (var s in shots)
@@ -1348,6 +1354,19 @@ namespace Battleship
                 RenderMyTorpedo(pendingCol, evs);                // fish run from the reported struck cell
             else
                 RenderMyShots(evs, pendingFireX, pendingFireY);  // shell salvo; handles the YOU WIN check
+        }
+
+        // I am the ATTACKER: the defender scouted their own board and reported the cell to reveal (or none).
+        // My recon plane crosses the scope and pings the contact — the defender owns that info, so I never
+        // resolve it myself. The turn is consumed either way (mirrors the defender's ApplyOpponentRadar).
+        private void OnRadarResult(byte[] body)
+        {
+            var cell = NetCodec.DecodeReveal(body);
+            match.UseMyPerk(ShipType.Carrier);
+            match.EndMyOnlineTurn();
+            awaitingResult = false;
+            targeting = true;
+            RenderMyRadar(cell);
         }
 
         // Package the shots I resolved (against my own board) into wire results, attaching each sunk
@@ -3943,8 +3962,31 @@ namespace Battleship
 
         private void DoRadar()
         {
-            if (OnlineActionBlocked()) return;
+            if (online) { RadarOnline(); return; }
             var c = match.PlayerRadar();
+            if (c == null) { message = "NO NEW CONTACTS."; return; }
+            RenderMyRadar(c);
+        }
+
+        // Online: I don't own the enemy layout, so I can't pick the reveal — send the intent and let the
+        // defender choose the cell. The plane + ping play when the reveal lands (OnRadarResult).
+        private void RadarOnline()
+        {
+            if (!match.PlayerTurn || match.Over || awaitingResult || InputLocked) return;
+            if (!match.PlayerPerks.Ready(match.PlayerBoard, ShipType.Carrier)) return;
+            awaitingResult = true;
+            pendingKind = MoveKind.Radar;
+            perkMode = PerkMode.None;
+            targeting = true;
+            net.SendMoveIntent(NetCodec.EncodeRadar());
+            Sfx(clipClick, 0.7f);
+            message = "📡 RECON PLANE LAUNCHED...";
+        }
+
+        // Animate my recon plane + reveal one contact — shared by single-player (match.PlayerRadar) and the
+        // networked reveal path. null cell = nothing left to find (turn still spent online).
+        private void RenderMyRadar((int x, int y)? c)
+        {
             if (c == null) { message = "NO NEW CONTACTS."; return; }
             pendX = c.Value.x; pendY = c.Value.y;        // blip revealed when the plane exits the top
             pendReveal = Time.time + planeTime;
