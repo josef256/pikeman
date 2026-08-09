@@ -32,6 +32,8 @@ namespace Battleship
         private bool online = false;        // true while in a networked 1v1 (disables the AI)
         private bool onlineWaiting = false; // pressed READY, waiting for the opponent's fleet
         private bool rematchWaiting = false;// at game-over: asked for a rematch, waiting on the opponent
+        private bool opponentLeft = false;  // opponent disconnected/left — no rematch possible
+        private bool forfeitWin = false;    // I won because the opponent left mid-match
         private bool awaitingResult = false;// online: fired an intent, waiting for the defender's result
         private int pendingFireX, pendingFireY; // online: the cell my in-flight shot targeted
         private MoveKind pendingKind = MoveKind.Fire; // online: which move I'm awaiting a result for
@@ -242,6 +244,7 @@ namespace Battleship
             net.OnMoveIntent += OnNetMoveIntent;    // opponent's decided move -> resolve on my board (defender)
             net.OnMoveResult += OnNetMoveResult;    // my shot's outcome -> fold into fog + animate (attacker)
             net.OnRematch += OnRematchAgreed;       // both asked for a rematch -> re-place fleets and replay
+            net.OnOpponentLeft += OnOpponentLeft;   // opponent dropped -> forfeit win / cancel rematch
             NewGame();
             phase = Phase.Menu; // first screen on launch is the home menu, not fleet setup
         }
@@ -259,7 +262,7 @@ namespace Battleship
             match = new BattleshipMatch();
             match.SetupEnemy(difficulty, seed);
             online = false; onlineWaiting = false;   // single-player by default; StartOnlineSetup re-arms online
-            awaitingResult = false; pendingScorch = false; rematchWaiting = false;
+            awaitingResult = false; pendingScorch = false; rematchWaiting = false; opponentLeft = false; forfeitWin = false;
             fleet = new FleetShip[Ships.Standard.Length];
             for (int i = 0; i < fleet.Length; i++) fleet[i] = new FleetShip { type = Ships.Standard[i], placed = false };
             dragIdx = -1; orient = Orientation.Horizontal; targeting = false;
@@ -1279,6 +1282,33 @@ namespace Battleship
             message = "Place your fleet, then READY.";
         }
 
+        // Fired by PikeNet when the opponent's link drops or they leave the room. Idempotent (once per
+        // match via opponentLeft). Mid-match = forfeit win for me; at game-over = cancel the rematch wait;
+        // during setup/lobby = bail back to the menu. LEAVE from the game-over panel returns to the menu.
+        private void OnOpponentLeft()
+        {
+            if (!online || opponentLeft) return;
+            opponentLeft = true;
+            rematchWaiting = false; awaitingResult = false; onlineWaiting = false;
+            if (phase == Phase.Playing && !match.Over)
+            {
+                forfeitWin = true;
+                phase = Phase.Over;
+                targeting = false;
+                message = T("OPPONENT LEFT - YOU WIN!");
+                Sfx(clipWin);
+            }
+            else if (phase == Phase.Over)
+            {
+                message = T("OPPONENT LEFT.");
+            }
+            else   // still placing fleets / waiting on the lobby — there's no game to win
+            {
+                net.Leave();
+                online = false; phase = Phase.Menu; message = "";
+            }
+        }
+
         // Fired by PikeNet once BOTH players ask for a rematch: reset and go back to fleet placement.
         // The normal READY -> FleetReady -> MatchStart handshake then runs again for the new match.
         private void OnRematchAgreed()
@@ -1694,6 +1724,7 @@ namespace Battleship
             // panel headers ("BATTLESHIP" title is handled inline — it collides with the ship name key below)
             { "YOU WIN!", "VOUS GAGNEZ !" }, { "AI WINS", "L'IA GAGNE" }, { "YOU LOSE", "VOUS PERDEZ" },
             { "🔄 REMATCH", "🔄 REVANCHE" }, { "🚪 LEAVE", "🚪 QUITTER" },
+            { "OPPONENT LEFT - YOU WIN!", "ADVERSAIRE PARTI - VOUS GAGNEZ !" }, { "OPPONENT LEFT.", "ADVERSAIRE PARTI." },
             { "PLACE YOUR FLEET", "PLACEZ VOTRE FLOTTE" }, { "TARGETING", "CIBLAGE" }, { "YOUR FLEET", "VOTRE FLOTTE" },
             { "TACTICAL RADAR", "RADAR TACTIQUE" },
             // main action buttons
@@ -2887,7 +2918,7 @@ namespace Battleship
             GUI.Label(new Rect(px, y, pw, big.fontSize + 8), lang == Lang.FR ? "BATAILLE NAVALE" : "BATTLESHIP", big);
             y += big.fontSize + 14;
 
-            string head = phase == Phase.Over ? (match.PlayerWon ? T("YOU WIN!") : T(online ? "YOU LOSE" : "AI WINS"))
+            string head = phase == Phase.Over ? ((match.PlayerWon || forfeitWin) ? T("YOU WIN!") : T(online ? "YOU LOSE" : "AI WINS"))
                         : phase == Phase.Setup ? T("PLACE YOUR FLEET")
                         : showTarget ? T("TARGETING") : T("YOUR FLEET");
             GUI.Label(new Rect(px, y, pw, hdr.fontSize + 6), head, hdr);
@@ -2945,13 +2976,17 @@ namespace Battleship
             }
             else if (online)
             {
-                // Networked game over: rematch (both must agree) or leave back to the menu.
-                var rr = new Rect(px, y, pw, bh * 1.3f);
-                if (rematchWaiting) GUI.Label(rr, T("Waiting for opponent..."), hdr);
-                else if (GUI.Button(rr, T("🔄 REMATCH"), btn)) { Sfx(clipClick, 0.7f); rematchWaiting = true; net.SendRematch(); }
-                y += bh * 1.3f + 10;
+                // Networked game over: rematch (both must agree) or leave back to the menu. Once the
+                // opponent has left, rematch is impossible — only offer LEAVE.
+                if (!opponentLeft)
+                {
+                    var rr = new Rect(px, y, pw, bh * 1.3f);
+                    if (rematchWaiting) GUI.Label(rr, T("Waiting for opponent..."), hdr);
+                    else if (GUI.Button(rr, T("🔄 REMATCH"), btn)) { Sfx(clipClick, 0.7f); rematchWaiting = true; net.SendRematch(); }
+                    y += bh * 1.3f + 10;
+                }
                 if (GUI.Button(new Rect(px, y, pw, bh * 1.3f), T("🚪 LEAVE"), btn))
-                { Sfx(clipClick, 0.7f); net.Leave(); online = false; rematchWaiting = false; phase = Phase.Menu; message = ""; }
+                { Sfx(clipClick, 0.7f); net.Leave(); online = false; rematchWaiting = false; opponentLeft = false; forfeitWin = false; phase = Phase.Menu; message = ""; }
             }
             else
             {

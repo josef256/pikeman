@@ -58,6 +58,10 @@ namespace Battleship
         /// <summary>Fires once, on both clients, when both have requested a rematch — re-arm and replay.</summary>
         public event Action OnRematch;
 
+        // Step 7f — the opponent vanished (relay link dropped or they left the session). Fires only while
+        // WE are still in the session (my own Leave nulls the session first, so it can't self-trigger).
+        public event Action OnOpponentLeft;
+
         public bool InSession => session != null;
 
         // ---- entry points (fire-and-forget; the UI polls the fields above) ----
@@ -200,7 +204,11 @@ namespace Battleship
             return transport != null && transport.Send(buf);
         }
 
-        private void OnRelayDisconnected() { PingOk = false; }
+        private void OnRelayDisconnected()
+        {
+            PingOk = false;
+            if (session != null) OnOpponentLeft?.Invoke();   // peer link dropped while I'm still in the room
+        }
 
         /// <summary>Called when THIS client asks for a rematch at the game-over screen.</summary>
         public void SendRematch()
@@ -264,7 +272,7 @@ namespace Battleship
         {
             session = s;
             s.PlayerJoined       += _ => RefreshCount();
-            s.PlayerHasLeft      += _ => RefreshCount();
+            s.PlayerHasLeft      += _ => { RefreshCount(); OnOpponentLeft?.Invoke(); };   // opponent left the session
             s.Changed            += RefreshCount;
             s.RemovedFromSession += OnRemoved;
         }
