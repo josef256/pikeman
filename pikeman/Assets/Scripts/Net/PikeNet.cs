@@ -53,6 +53,11 @@ namespace Battleship
         /// <summary>Defender's resolved outcome arrived — the attacker applies it. Arg = the tag-free body.</summary>
         public event Action<byte[]> OnMoveResult;
 
+        // Step 7e — rematch handshake: both players must ask for a rematch before a new match begins.
+        private bool localRematch, remoteRematch;
+        /// <summary>Fires once, on both clients, when both have requested a rematch — re-arm and replay.</summary>
+        public event Action OnRematch;
+
         public bool InSession => session != null;
 
         // ---- entry points (fire-and-forget; the UI polls the fields above) ----
@@ -108,7 +113,7 @@ namespace Battleship
             var s = session;
             session = null; transport = null;   // the SDK calls transport.StopAsync as the session network tears down
             State = Status.Offline; JoinCode = ""; PlayerCount = 0; Error = ""; IsHost = false; PingOk = false;
-            localReady = remoteReady = matchStarted = false;
+            localReady = remoteReady = matchStarted = false; localRematch = remoteRematch = false;
             if (s != null) { try { await s.LeaveAsync(); } catch { /* best-effort on the way out */ } }
         }
 
@@ -163,6 +168,10 @@ namespace Battleship
                 case NetMsg.MoveResult:
                     OnMoveResult?.Invoke(Body(data));                     // attacker: apply the resolved outcome
                     break;
+                case NetMsg.Rematch:
+                    remoteRematch = true;                                 // opponent wants to play again
+                    TryRematch();
+                    break;
             }
         }
 
@@ -192,6 +201,23 @@ namespace Battleship
         }
 
         private void OnRelayDisconnected() { PingOk = false; }
+
+        /// <summary>Called when THIS client asks for a rematch at the game-over screen.</summary>
+        public void SendRematch()
+        {
+            localRematch = true;
+            transport?.Send(new byte[] { (byte)NetMsg.Rematch });
+            TryRematch();
+        }
+
+        // Both players agreed: re-arm the FleetReady/MatchStart handshake and tell the game to replay.
+        private void TryRematch()
+        {
+            if (!localRematch || !remoteRematch) return;
+            localRematch = remoteRematch = false;
+            localReady = remoteReady = matchStarted = false;   // so the next FleetReady/MatchStart runs fresh
+            OnRematch?.Invoke();
+        }
 
         /// <summary>Called when THIS client has placed its fleet and pressed READY.</summary>
         public void SendFleetReady()
@@ -255,7 +281,7 @@ namespace Battleship
         {
             session = null; transport = null;
             State = Status.Offline; PlayerCount = 0; JoinCode = ""; IsHost = false; PingOk = false;
-            localReady = remoteReady = matchStarted = false;
+            localReady = remoteReady = matchStarted = false; localRematch = remoteRematch = false;
         }
 
         private void Fail(Exception ex)

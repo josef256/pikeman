@@ -31,6 +31,7 @@ namespace Battleship
         private string netCodeEntry = "";   // room code the guest is typing in the JOIN field
         private bool online = false;        // true while in a networked 1v1 (disables the AI)
         private bool onlineWaiting = false; // pressed READY, waiting for the opponent's fleet
+        private bool rematchWaiting = false;// at game-over: asked for a rematch, waiting on the opponent
         private bool awaitingResult = false;// online: fired an intent, waiting for the defender's result
         private int pendingFireX, pendingFireY; // online: the cell my in-flight shot targeted
         private MoveKind pendingKind = MoveKind.Fire; // online: which move I'm awaiting a result for
@@ -240,6 +241,7 @@ namespace Battleship
             net.OnMatchStart += BeginOnlineMatch;   // both fleets ready -> drop into Playing in sync
             net.OnMoveIntent += OnNetMoveIntent;    // opponent's decided move -> resolve on my board (defender)
             net.OnMoveResult += OnNetMoveResult;    // my shot's outcome -> fold into fog + animate (attacker)
+            net.OnRematch += OnRematchAgreed;       // both asked for a rematch -> re-place fleets and replay
             NewGame();
             phase = Phase.Menu; // first screen on launch is the home menu, not fleet setup
         }
@@ -257,7 +259,7 @@ namespace Battleship
             match = new BattleshipMatch();
             match.SetupEnemy(difficulty, seed);
             online = false; onlineWaiting = false;   // single-player by default; StartOnlineSetup re-arms online
-            awaitingResult = false; pendingScorch = false;
+            awaitingResult = false; pendingScorch = false; rematchWaiting = false;
             fleet = new FleetShip[Ships.Standard.Length];
             for (int i = 0; i < fleet.Length; i++) fleet[i] = new FleetShip { type = Ships.Standard[i], placed = false };
             dragIdx = -1; orient = Orientation.Horizontal; targeting = false;
@@ -1277,6 +1279,14 @@ namespace Battleship
             message = "Place your fleet, then READY.";
         }
 
+        // Fired by PikeNet once BOTH players ask for a rematch: reset and go back to fleet placement.
+        // The normal READY -> FleetReady -> MatchStart handshake then runs again for the new match.
+        private void OnRematchAgreed()
+        {
+            rematchWaiting = false;
+            StartOnlineSetup();
+        }
+
         // Fired by PikeNet once both players are READY. myTurn = does this client shoot first.
         private void BeginOnlineMatch(bool myTurn)
         {
@@ -1682,7 +1692,8 @@ namespace Battleship
             { "MULTIPLAYER — COMING SOON", "MULTIJOUEUR — BIENTOT DISPONIBLE" },
             { "MUSIC", "MUSIQUE" }, { "SFX", "EFFETS" }, { "LANGUAGE", "LANGUE" }, { "◀ BACK", "◀ RETOUR" },
             // panel headers ("BATTLESHIP" title is handled inline — it collides with the ship name key below)
-            { "YOU WIN!", "VOUS GAGNEZ !" }, { "AI WINS", "L'IA GAGNE" },
+            { "YOU WIN!", "VOUS GAGNEZ !" }, { "AI WINS", "L'IA GAGNE" }, { "YOU LOSE", "VOUS PERDEZ" },
+            { "🔄 REMATCH", "🔄 REVANCHE" }, { "🚪 LEAVE", "🚪 QUITTER" },
             { "PLACE YOUR FLEET", "PLACEZ VOTRE FLOTTE" }, { "TARGETING", "CIBLAGE" }, { "YOUR FLEET", "VOTRE FLOTTE" },
             { "TACTICAL RADAR", "RADAR TACTIQUE" },
             // main action buttons
@@ -2876,7 +2887,7 @@ namespace Battleship
             GUI.Label(new Rect(px, y, pw, big.fontSize + 8), lang == Lang.FR ? "BATAILLE NAVALE" : "BATTLESHIP", big);
             y += big.fontSize + 14;
 
-            string head = phase == Phase.Over ? (match.PlayerWon ? T("YOU WIN!") : T("AI WINS"))
+            string head = phase == Phase.Over ? (match.PlayerWon ? T("YOU WIN!") : T(online ? "YOU LOSE" : "AI WINS"))
                         : phase == Phase.Setup ? T("PLACE YOUR FLEET")
                         : showTarget ? T("TARGETING") : T("YOUR FLEET");
             GUI.Label(new Rect(px, y, pw, hdr.fontSize + 6), head, hdr);
@@ -2931,6 +2942,16 @@ namespace Battleship
                 y = PerkButton(px, y, pw, ShipType.Submarine,
                     T(perkMode == PerkMode.Torpedo ? "🐟 TORPEDO ◀ pick a lane" : "🐟 TORPEDO"),
                     () => { perkMode = perkMode == PerkMode.Torpedo ? PerkMode.None : PerkMode.Torpedo; targeting = perkMode == PerkMode.Torpedo; });
+            }
+            else if (online)
+            {
+                // Networked game over: rematch (both must agree) or leave back to the menu.
+                var rr = new Rect(px, y, pw, bh * 1.3f);
+                if (rematchWaiting) GUI.Label(rr, T("Waiting for opponent..."), hdr);
+                else if (GUI.Button(rr, T("🔄 REMATCH"), btn)) { Sfx(clipClick, 0.7f); rematchWaiting = true; net.SendRematch(); }
+                y += bh * 1.3f + 10;
+                if (GUI.Button(new Rect(px, y, pw, bh * 1.3f), T("🚪 LEAVE"), btn))
+                { Sfx(clipClick, 0.7f); net.Leave(); online = false; rematchWaiting = false; phase = Phase.Menu; message = ""; }
             }
             else
             {
